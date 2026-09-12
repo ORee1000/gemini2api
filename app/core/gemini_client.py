@@ -470,13 +470,22 @@ class GeminiWebClient:
 
         await self._obtain_session_token()
 
+        # 纯可观测性（issue #11）：无论走哪个分支，都明说 PSIDTS 轮换循环有没有启动、为什么。
+        # _ensure_refresh_task() 只在下面这个 else 分支和 reload_cookies() 里被调用，
+        # 也就是说「正常启动」的网关从来不跑 _auto_refresh_loop —— 而这件事过去在日志里
+        # 没有任何痕迹（没启动就什么都不打），排查 PSIDTS 过期类问题时只能靠读源码推断。
         if self._session_token:
             self._healthy = True
             await self._send_heartbeat()
             logger.info("Gemini client ready")
+            logger.info(
+                "Auto-refresh loop NOT started (startup token OK; PSIDTS rotation only runs "
+                "after a failed start or a manual cookie reload)"
+            )
         else:
             logger.warning("Token not found, rotating cookies")
             self._ensure_refresh_task()
+            logger.info("Auto-refresh loop started (startup token missing)")
 
         if settings.health_check_enabled:
             self._health_check_task = asyncio.create_task(self._health_check_loop())
