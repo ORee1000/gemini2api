@@ -277,6 +277,17 @@ function _accountEmptyRow(account) {
             </div>`;
 }
 
+// 最近错误的展示文本：错误摘要 + 发生时间。
+// release(success=True) 只清 consecutive_failures / consecutive_empty，从不清 last_error，
+// 所以三周前撞过一次 503 的账号今天仍然稳定显示那行字。不带时间的话运维会照着这条陈年旧账
+// 去查根因 —— 正是 issue #11 要根治的"面板说了一句没有鉴别力的话"。
+// 后端 get_status() 已经导出 last_error_at，这里把它渲染出来。
+function _accountLastErrorText(account) {
+    const msg = escapeHtml(String(account?.last_error ?? ''));
+    if (!account?.last_error_at) return msg;
+    return `${msg} (${escapeHtml(formatDate(account.last_error_at))})`;
+}
+
 // 健康提示渲染成一行 account-detail；无提示时返回空串（不占位）。
 // 注意：note.text 里可能拼进后端来的数字，统一走 escapeHtml。
 function _accountHealthRow(account) {
@@ -431,7 +442,7 @@ async function loadAccounts() {
                 ${account.last_error ? `
                 <div class="account-detail">
                     <span class="label">${t('accounts.lastError')}</span>
-                    <span class="value text-muted">${escapeHtml(String(account.last_error))}</span>
+                    <span class="value text-muted">${_accountLastErrorText(account)}</span>
                 </div>` : ''}
                 <div class="account-actions">
                     <button class="btn btn-sm btn-outline acc-check-btn" data-account-id="${idEsc}">
