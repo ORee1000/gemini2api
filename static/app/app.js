@@ -5,7 +5,7 @@
 import { initializeComponents } from './component-loader.js';
 import { initThemeSwitcher } from './theme-switcher.js';
 import { initAuth, apiCall, logout } from './auth.js';
-import { showToast, formatNumber, getStatusBadge, maskString, copyToClipboard, showConfirm } from './utils.js';
+import { showToast, formatNumber, getStatusBadge, maskString, copyToClipboard, showConfirm, formatDate } from './utils.js';
 import { initUsageStats, loadUsageStats } from './usage-chart.js';
 import { initLogs } from './logs.js';
 import { initSettings, loadSettings } from './settings.js';
@@ -227,6 +227,41 @@ function initLightbox() {
     if (closeBtn) closeBtn.addEventListener('click', closeLightbox);
 }
 
+// 账号卡片上的健康提示（纯函数，无 DOM 依赖，可被 node 直接跑）。
+// issue #11 的教训：status 只有连挂 3 次或撞 401/403 才会变 EXPIRED，所以 cookie 已经
+// 死透的账号在面板上照样绿着 ACTIVE；Requests/Errors/Models 也都没有鉴别力。
+// 这里把后端真正的健康位和连续失败数摆出来，"绿着但已经死了"一眼可见。
+// 返回 null 表示没什么好说的（健康且无连续失败），此时卡片不加任何噪音。
+function _accountHealthNote(account) {
+    if (!account) return null;
+    if (account.is_healthy === false) {
+        // 后端说会话不健康，但状态还标着 active —— 这正是面板骗人的那一格
+        return {
+            cls: account.status === 'active' ? 'text-danger' : 'text-muted',
+            text: account.status === 'active'
+                ? t('accounts.healthMismatch')
+                : t('accounts.sessionUnhealthy')
+        };
+    }
+    const streak = Number(account.consecutive_failures) || 0;
+    if (streak > 0) {
+        return { cls: 'text-warning', text: `${t('accounts.consecutiveFailures')}: ${streak}` };
+    }
+    return null;
+}
+
+// 健康提示渲染成一行 account-detail；无提示时返回空串（不占位）。
+// 注意：note.text 里可能拼进后端来的数字，统一走 escapeHtml。
+function _accountHealthRow(account) {
+    const note = _accountHealthNote(account);
+    if (!note) return '';
+    return `
+            <div class="account-detail">
+                <span class="label">${t('accounts.health')}</span>
+                <span class="value ${note.cls}">${escapeHtml(note.text)}</span>
+            </div>`;
+}
+
 function renderAccountStatusGrid(accounts) {
     const container = document.getElementById('accountStatusGrid');
     if (!container) return;
@@ -259,6 +294,10 @@ function renderAccountStatusGrid(accounts) {
                 <span class="label">${t('accounts.models')}</span>
                 <span class="value">${account.models_count || 0}</span>
             </div>
+            <div class="account-detail">
+                <span class="label">${t('accounts.lastSuccess')}</span>
+                <span class="value">${escapeHtml(formatDate(account.last_success_at))}</span>
+            </div>${_accountHealthRow(account)}
         </div>
     `).join('');
 }
@@ -357,6 +396,16 @@ async function loadAccounts() {
                     <span class="label">${t('accounts.models')}</span>
                     <span class="value">${(account.models || []).length || account.models_count || 0}</span>
                 </div>
+                <div class="account-detail">
+                    <span class="label">${t('accounts.lastSuccess')}</span>
+                    <span class="value">${escapeHtml(formatDate(account.last_success_at))}</span>
+                </div>
+    ${_accountHealthRow(account)}
+                ${account.last_error ? `
+                <div class="account-detail">
+                    <span class="label">${t('accounts.lastError')}</span>
+                    <span class="value text-muted">${escapeHtml(String(account.last_error))}</span>
+                </div>` : ''}
                 <div class="account-actions">
                     <button class="btn btn-sm btn-outline acc-check-btn" data-account-id="${idEsc}">
                         <i class="fas fa-heartbeat"></i> ${t('accounts.check')}

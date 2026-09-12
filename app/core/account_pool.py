@@ -45,6 +45,22 @@ def _is_retryable(exc: Exception) -> bool:
     return False
 
 
+def _error_summary(exc: Exception) -> str:
+    """把异常压成「异常类型 + HTTP 状态码」的安全摘要，供 Account.last_error 存放。
+
+    刻意丢掉 str(exc) 原文，理由是这个字段会经 /admin/status、/admin/accounts 原样返回
+    并渲染进管理面板，而 admin.py 的 _masked_status() 只掩码 psid 一个键，响应层不会兜底：
+    - HTTPStatusError 的消息里嵌着 Google 响应正文的前 200 字节（见 gemini_client），
+      可能带登录态标识 / SNlM0e token / 账号邮箱；
+    - ValueError（模型不可用）的消息里嵌着客户端可控的 model 名，会变成面板的存储型 XSS 入口。
+    异常类型 + 状态码已经足够分辨"是限流、是凭据失效、还是客户端没就绪"，
+    比现在完全空白的 last_error 强，且零泄露风险。
+    """
+    if isinstance(exc, HTTPStatusError):
+        return f"{type(exc).__name__} (HTTP {exc.status_code})"
+    return type(exc).__name__
+
+
 class AccountStatus(str, Enum):
     ACTIVE = "active"
     EXPIRED = "expired"
@@ -69,7 +85,12 @@ class Account:
     consecutive_failures: int = 0
     active_requests: int = 0
     last_used: datetime | None = None
+    # 最近一次「真的吐出了内容」的时间。刻意与 last_used（派活时间）分开：cookie 死透的
+    # 账号每来一个请求 last_used 都会刷新，面板照样一片绿，issue #11 的截图就毁在这上面。
+    last_success_at: datetime | None = None
+    # 最近一次失败的安全摘要（见 _error_summary：只留异常类型 + HTTP 状态码，不留原文）
     last_error: str = ""
+    last_error_at: datetime | None = None
     # 被 5xx/503 限流后的冷却截止时间戳（loop.time()）；冷却期内不优先选，但不算 expired
     cooldown_until: float = 0.0
     # 会话自愈（reload_cookies）的单飞标志：为真表示已有请求在锁外跑自愈，其余并发请求
@@ -427,12 +448,17 @@ class AccountPool:
             # 回到外层循环重新取锁、重新 _find_available()：
             # 自愈成功 → 直接拿到槽位；失败/超预算 → 下一轮走上面的 NO_HEALTHY_ACCOUNT_MSG 分支。
 
-    async def release(self, account: Account, success: bool, cooldown: bool = False):
+    async def release(self, account: Account, success: bool, cooldown: bool = False, *, error: str = ""):
+        """error 是 _error_summary() 出来的安全摘要（keyword-only + 默认空串，既有调用点行为不变）。"""
         async with self._cond:
             account.active_requests = max(0, account.active_requests - 1)
             account.request_count += 1
+            if not success and error:
+                account.last_error = error
+                account.last_error_at = datetime.now(timezone.utc)
             if success:
                 account.consecutive_failures = 0
+                account.last_success_at = datetime.now(timezone.utc)
             elif cooldown:
                 # 5xx/503 限流：不是账号坏，只是被 Google 临时限流。
                 # 设短期冷却（期间降级不优先选），不累积失败、不标 expired。
@@ -620,6 +646,14 @@ class AccountPool:
 
     def get_status(self) -> dict:
         accounts_info = []
+        # 循环外取一次即可（循环里反复取 event loop 纯属浪费）。
+        # get_running_loop 而不是 get_event_loop：后者在没有运行中 loop 的同步上下文
+        # （诊断脚本 / 测试）里会直接抛 RuntimeError，把一个纯只读的状态导出搞崩。
+        # 取不到时钟就按"未冷却"处理 —— 新建 loop 的 time() 本来也是从 0 起算。
+        try:
+            loop_now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            loop_now = 0.0
         for a in self._accounts:
             accounts_info.append({
                 "id": a.id,
@@ -630,7 +664,16 @@ class AccountPool:
                 "error_count": a.error_count,
                 "active_requests": a.active_requests,
                 "last_used": a.last_used.isoformat() if a.last_used else None,
-                "cooling_down": a.cooldown_until > asyncio.get_event_loop().time(),
+                "cooling_down": a.cooldown_until > loop_now,
+                # issue #11：下面这几个才是有鉴别力的健康信号。status 只有连挂 3 次或撞 401/403
+                # 才会变 EXPIRED，所以"cookie 已经死透但面板一直绿着 ACTIVE"是常态；
+                # models_count 只要 client 对象在就恒等于公开模型数，同样证明不了会话还活着。
+                "is_healthy": bool(a.client is not None and a.client.is_healthy),
+                "consecutive_failures": a.consecutive_failures,
+                "last_success_at": a.last_success_at.isoformat() if a.last_success_at else None,
+                # 安全摘要，不含上游原文（见 _error_summary）
+                "last_error": a.last_error,
+                "last_error_at": a.last_error_at.isoformat() if a.last_error_at else None,
                 "models": self.models if a.client else [],
                 "models_count": len(self.models) if a.client else 0,
             })
@@ -689,13 +732,13 @@ class AccountPool:
                     # 可重试：5xx 冷却该账号、401/403 标 expired，换下一个账号重试
                     last_err = e
                     tried.add(account.id)
-                    await self.release(account, success=False, cooldown=_is_5xx(e))
+                    await self.release(account, success=False, cooldown=_is_5xx(e), error=_error_summary(e))
                     released = True
                     if isinstance(e, HTTPStatusError) and e.status_code in (401, 403):
                         account.status = AccountStatus.EXPIRED
                     logger.warning(f"Account {account.id} got {e}; failing over (tried={len(tried)})")
                     continue
-                await self.release(account, success=False)
+                await self.release(account, success=False, error=_error_summary(e))
                 released = True
                 raise
             finally:
@@ -756,14 +799,14 @@ class AccountPool:
                 if _is_retryable(e) and not emitted_any:
                     last_err = e
                     tried.add(account.id)
-                    await self.release(account, success=False, cooldown=_is_5xx(e))
+                    await self.release(account, success=False, cooldown=_is_5xx(e), error=_error_summary(e))
                     released = True
                     if isinstance(e, HTTPStatusError) and e.status_code in (401, 403):
                         account.status = AccountStatus.EXPIRED
                     logger.warning(f"Account {account.id} got {e} before first chunk; stream failing over (tried={len(tried)})")
                     failover = True
                 else:
-                    await self.release(account, success=False)
+                    await self.release(account, success=False, error=_error_summary(e))
                     released = True
                     raise
             finally:

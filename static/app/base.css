@@ -864,6 +864,10 @@ tr:hover {
     color: var(--danger-color);
 }
 
+.text-warning {
+    color: var(--warning-color);
+}
+
 .hidden {
     display: none !important;
 }
