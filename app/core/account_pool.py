@@ -488,8 +488,16 @@ class AccountPool:
                 account.last_error_at = datetime.now(timezone.utc)
             if success and empty:
                 # 空响应：只累计，单次绝不降级账号（内容拒答之类的正常情况长得一模一样）。
-                # 刻意不碰 status / cooldown_until / consecutive_failures，也刻意不打
-                # last_success_at —— 吐了个空并不能证明这个会话还活着，不该替真实失败擦屁股。
+                # 刻意不碰 status / cooldown_until，也刻意不打 last_success_at ——
+                # 吐了个空并不能证明这个会话真的还能生成内容。
+                #
+                # 但 consecutive_failures 必须照旧清零：这一批「只做可观测性」，不许动
+                # failover 语义。基线里空响应走的是 release(success=True)，会清零；
+                # 若这里不清零，「偶发失败 / 空 / 偶发失败 / 空 / 偶发失败」这种混合序列
+                # 会在第 5 次把 cf 顶到 3、把一个 cookie 完好的账号标成 EXPIRED 踢出轮换，
+                # 而基线下它始终 ACTIVE。空响应的可见性由下面 consecutive_empty /
+                # empty_count / Errors 三个新计数器负责，不靠改降级阈值来表达。
+                account.consecutive_failures = 0
                 account.consecutive_empty += 1
                 account.empty_count += 1
                 if account.consecutive_empty >= EMPTY_STREAK_THRESHOLD:

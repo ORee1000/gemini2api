@@ -9,6 +9,7 @@
 
 import asyncio
 import json
+import re
 import shutil
 import subprocess
 import textwrap
@@ -159,11 +160,38 @@ def test_empty_release_does_not_stamp_last_success():
     assert a.last_success_at is None
 
 
-def test_empty_release_does_not_clear_real_failures():
-    """空响应不该替真实的连续失败擦屁股。"""
+def test_empty_release_clears_consecutive_failures_like_the_baseline():
+    """本批只做可观测性：空响应对 failover 的影响必须与基线逐字节一致。
+
+    基线里空响应走的是 release(success=True)，会把 consecutive_failures 清零。
+    这里必须照做 —— 否则就是在偷偷收紧降级阈值（见下面的混合序列用例）。
+    """
     a = _acc(active_requests=1, consecutive_failures=2)
     asyncio.run(_release(_pool(a), a, empty=True))
-    assert a.consecutive_failures == 2
+    assert a.consecutive_failures == 0
+
+
+def test_mixed_failure_and_empty_sequence_does_not_expire_the_account():
+    """回归守卫：偶发失败与空响应交替出现时，账号不得被踢出轮换。
+
+    真实场景：Gemini 网页版对敏感问题返回 200 空体，与偶发解析错误交替出现。
+    基线（空响应走 success=True）跑完这串后 cf=1、账号 ACTIVE；如果空响应分支不再
+    清零 consecutive_failures，第 5 次就会把 cf 顶到 3 → EXPIRED，多账号池里要等池子
+    跑空才由 _try_recover_expired 捞回来。这是容量/failover 行为变更，不属于本批。
+    """
+    a = _acc(active_requests=5)
+    pool = _pool(a)
+
+    async def go():
+        for empty in (False, True, False, True, False):
+            await pool.release(a, success=empty, empty=empty)
+
+    asyncio.run(go())
+    assert a.consecutive_failures == 1, "空响应必须打断连续失败计数（与基线一致）"
+    assert a.status == AccountStatus.ACTIVE, "cookie 完好的账号不得被这串序列标成 EXPIRED"
+    # 空响应本身仍然全额可见，可观测性一分不少
+    assert a.empty_count == 2
+    assert a.error_count == 3
 
 
 def test_non_empty_release_keeps_its_old_behaviour():
@@ -360,14 +388,29 @@ def _extract_function(source: str, name: str) -> str:
     raise AssertionError(f"{name} 的大括号没配对，app.js 格式可能变了")
 
 
+def _frontend_threshold() -> int:
+    """把 app.js 里的阈值常量**提取**出来（而不是断言某行源码长什么样）。"""
+    src = _APP_JS.read_text(encoding="utf-8")
+    m = re.search(r"^const EMPTY_STREAK_THRESHOLD = (\d+);$", src, re.M)
+    assert m, "没找到前端 EMPTY_STREAK_THRESHOLD 常量，app.js 格式可能变了"
+    return int(m.group(1))
+
+
+def test_frontend_and_backend_thresholds_agree():
+    """前后端阈值必须一致，否则面板连空 3 次就标红、后端要到第 5 次才在 Errors 上留痕。"""
+    assert _frontend_threshold() == EMPTY_STREAK_THRESHOLD, (
+        f"app.js 的 EMPTY_STREAK_THRESHOLD={_frontend_threshold()} 与后端的 "
+        f"{EMPTY_STREAK_THRESHOLD} 对不上，面板和计数器会各说各话"
+    )
+
+
 def _note(account: dict, tmp_path: Path):
     src = _APP_JS.read_text(encoding="utf-8")
     fn = _extract_function(src, "_accountEmptyNote")
     assert fn.strip().startswith("function _accountEmptyNote("), "没切到 _accountEmptyNote"
-    assert "const EMPTY_STREAK_THRESHOLD = 3;" in src, "前端阈值常量没了，app.js 格式可能变了"
     script = tmp_path / "empty.mjs"
     script.write_text(
-        "const EMPTY_STREAK_THRESHOLD = 3;\n" + fn + textwrap.dedent("""
+        f"const EMPTY_STREAK_THRESHOLD = {_frontend_threshold()};\n" + fn + textwrap.dedent("""
         function t(k) { return k; }
         process.stdout.write(JSON.stringify(_accountEmptyNote(JSON.parse(process.argv[2]))));
         """),
