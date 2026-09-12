@@ -590,6 +590,70 @@ function _pgFormatPlaygroundError(error, status) {
     return `${t('playground.requestFailed')} (${status || 'unknown'})`;
 }
 
+// SSE 帧分类（纯函数，无 DOM 依赖，可被 node 直接跑）。
+// 后端出错时发的是顶层 {"error":{message,type,code}} 帧（app/routers/openai.py::_err_chunk），
+// 它没有 choices —— 旧代码只读 chunk.choices[0].delta，于是 503/529/500/400 全部被静默吃掉，
+// 最后一律渲染成"无响应内容"，真实原因彻底丢失（issue #11）。
+function _pgClassifyChunk(chunk) {
+    if (chunk && typeof chunk === 'object' && chunk.error && typeof chunk.error === 'object') {
+        return {
+            kind: 'error',
+            message: chunk.error.message == null ? '' : String(chunk.error.message),
+            // responses/gemini/claude 路由的 error 帧没有 code，必须容忍 undefined/null
+            code: chunk.error.code == null ? null : chunk.error.code
+        };
+    }
+    const delta = chunk?.choices?.[0]?.delta;
+    return {
+        kind: 'delta',
+        role: delta?.role || '',
+        content: delta?.content || '',
+        reasoning: delta?.reasoning_content || '',
+        toolCalls: delta?.tool_calls || null
+    };
+}
+
+// error 帧 → 给用户看的一行文本（纯函数）。
+// message 是上游 str(exc) 原文，完全不可信：这里只做长度钳制与空白折叠，
+// 转义由调用方用 textContent 承担（绝不进 innerHTML，更不能进 _pgRenderContent —— 后者会把
+// 文本里的图片 URL 还原成 <img>）。
+const _PG_ERR_MAX = 500;
+function _pgFormatStreamError(err) {
+    const raw = String(err?.message ?? '').replace(/\s+/g, ' ').trim();
+    const msg = raw.length > _PG_ERR_MAX ? `${raw.slice(0, _PG_ERR_MAX)}…` : raw;
+    const head = err?.code == null
+        ? t('playground.gatewayError')
+        : `${t('playground.gatewayError')} (${err.code})`;
+    return msg ? `${head}: ${msg}` : head;
+}
+
+// 流收尾后决定气泡最终呈现（纯函数）。四种结果：
+//   'error'         —— 出错且一个字都没流出来：整条替换成错误文本
+//   'partial-error' —— 已经流出内容后才出错：保留已收到的内容，错误追加在末尾（绝不抹掉）
+//   'empty'         —— 无内容也无错误：合法空响应（只有思考链 / 占位被过滤 / 上游 200 空体），
+//                      沿用"无响应内容"，不伪造错误
+//   'content'       —— 正常
+function _pgStreamOutcome(content, streamError) {
+    if (streamError) {
+        return {
+            mode: content ? 'partial-error' : 'error',
+            content: content || '',
+            errorText: _pgFormatStreamError(streamError)
+        };
+    }
+    if (!content) return { mode: 'empty', content: '', errorText: '' };
+    return { mode: 'content', content, errorText: '' };
+}
+
+// 上游错误文本一律走 textContent 构建 DOM，天然免疫注入；不用 innerHTML 模板串，
+// 免得日后有人顺手把 message 挪进属性上下文（escapeHtml 不转义引号）。
+function _pgErrorSpan(text) {
+    const span = document.createElement('span');
+    span.className = 'text-danger';
+    span.textContent = text;
+    return span;
+}
+
 function _pgSetSendBusy(busy) {
     const pgSend = document.getElementById('pg-send');
     if (!pgSend) return;
@@ -694,6 +758,7 @@ async function sendPlaygroundRequest() {
         let buffer = '';
         let content = '';
         let gotContent = false;
+        let streamError = null;
         let reasoningBody = null;
         const ensureReasoningBlock = () => {
             if (reasoningBody) return reasoningBody;
@@ -730,12 +795,18 @@ async function sendPlaygroundRequest() {
                 if (data === '[DONE]') break;
                 try {
                     const chunk = JSON.parse(data);
-                    const delta = chunk.choices?.[0]?.delta;
-                    if (delta?.role && !delta?.content && isImageGen && !gotContent) {
+                    const info = _pgClassifyChunk(chunk);
+                    if (info.kind === 'error') {
+                        // 记下来，但不中断循环：错误帧后面紧跟 [DONE]，收尾时统一渲染，
+                        // 这样已经流出的内容也能原样保住。
+                        streamError = info;
+                        continue;
+                    }
+                    if (info.role && !info.content && isImageGen && !gotContent) {
                         _pgShowStillWorking(aiBubble);
                         continue;
                     }
-                    const piece = delta?.content || '';
+                    const piece = info.content;
                     if (piece) {
                         gotContent = true;
                         _pgClearGeneratingState(aiMsg, aiBubble);
@@ -743,7 +814,7 @@ async function sendPlaygroundRequest() {
                         aiBubble.textContent = content;
                         chatContainer.scrollTop = chatContainer.scrollHeight;
                     }
-                    const rPiece = delta?.reasoning_content || '';
+                    const rPiece = info.reasoning;
                     if (rPiece) {
                         const rb = ensureReasoningBlock();
                         rb.textContent += rPiece;
@@ -753,14 +824,27 @@ async function sendPlaygroundRequest() {
             }
         }
 
-        if (!content) {
-            _pgClearGeneratingState(aiMsg, aiBubble);
+        const outcome = _pgStreamOutcome(content, streamError);
+        _pgClearGeneratingState(aiMsg, aiBubble);
+        if (outcome.mode === 'error') {
+            // 一个字都没收到：这一轮没有助手回复，把用户消息弹回去（与 !resp.ok / catch 分支一致），
+            // 否则下一轮会重复发送一条没有应答的孤儿消息。
+            _pgMessages.pop();
+            aiBubble.textContent = '';
+            aiBubble.appendChild(_pgErrorSpan(outcome.errorText));
+        } else if (outcome.mode === 'partial-error') {
+            // 已收到的内容照常渲染，错误只做追加 —— 绝不把用户已经看到的正文抹掉
+            aiBubble.innerHTML = _pgRenderContent(outcome.content);
+            aiBubble.appendChild(document.createElement('br'));
+            aiBubble.appendChild(_pgErrorSpan(outcome.errorText));
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+            _pgMessages.push({ role: 'assistant', content: outcome.content });
+        } else if (outcome.mode === 'empty') {
             aiBubble.textContent = t('playground.noContent');
         } else {
-            _pgClearGeneratingState(aiMsg, aiBubble);
-            aiBubble.innerHTML = _pgRenderContent(content);
+            aiBubble.innerHTML = _pgRenderContent(outcome.content);
             chatContainer.scrollTop = chatContainer.scrollHeight;
-            _pgMessages.push({ role: 'assistant', content: content });
+            _pgMessages.push({ role: 'assistant', content: outcome.content });
         }
     } catch (error) {
         _pgMessages.pop();
