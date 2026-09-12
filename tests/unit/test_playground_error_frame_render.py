@@ -62,6 +62,25 @@ def _extract_stream_tail(source: str) -> str:
     return tail
 
 
+def _extract_chunk_body(source: str) -> str:
+    """切出流循环里**真正处理单个 chunk 的那段**（issue #11 的真正 call site）。
+
+    以前这段是 harness 里等价复刻的，于是把 app.js 里
+    `if (info.kind === 'error') { streamError = info; continue; }` 整块删掉、
+    或者把 _pgClassifyChunk(chunk) 换回旧的 chunk.choices[0].delta 内联写法，
+    都能让 issue #11 原样复发而测试全绿 —— 覆盖边界恰好停在函数入口。
+
+    现在从 app.js 原样切出来执行：上面两种改法一种让 marker 消失（ValueError），
+    一种让 streamError 永远是 null（错误帧落回 'empty' 分支），都会当场变红。
+    """
+    marker = "const info = _pgClassifyChunk(chunk);"
+    start = source.index(marker)  # 找不到 = 调用点被改写，直接 ValueError 报红
+    end = source.index("\n                } catch {}", start)
+    body = source[start:end]
+    assert len(body) > 200, f"切出的 chunk 处理段太短，app.js 格式可能变了: {body!r}"
+    return body
+
+
 def _harness() -> str:
     src = _app_source()
     pieces = [
@@ -77,6 +96,7 @@ def _harness() -> str:
     assert const_match, "没找到 _PG_ERR_MAX 常量，app.js 格式可能变了"
 
     tail = _extract_stream_tail(src)
+    chunk_body = _extract_chunk_body(src)
 
     return (
         f"const _PG_ERR_MAX = {const_match.group(1)};\n"
@@ -108,42 +128,54 @@ def _harness() -> str:
             };
         }
 
-        function run(frames) {
+        function run(frames, opts) {
             const _pgMessages = [{ role: 'user', content: 'q' }];
             const aiMsg = makeEl('div');
             const aiBubble = makeEl('div');
             const chatContainer = { scrollTop: 0, scrollHeight: 100 };
             let cleared = 0;
             const _pgClearGeneratingState = () => { cleared += 1; };
+            const isImageGen = !!(opts && opts.isImageGen);
+            let stillWorking = 0;
+            const _pgShowStillWorking = () => { stillWorking += 1; };
 
             let content = '';
-            let reasoning = '';
+            let gotContent = false;
             let streamError = null;
+            let reasoning = '';
+            const _reasoningBody = {
+                get textContent() { return reasoning; },
+                set textContent(v) { reasoning = String(v); },
+            };
+            const ensureReasoningBlock = () => _reasoningBody;
+
+            // ↓↓↓ 从 app.js 原样切出来的逐帧处理段（不是等价复刻）
             for (const chunk of frames) {
-                const info = _pgClassifyChunk(chunk);
-                if (info.kind === 'error') { streamError = info; continue; }
-                if (info.content) content += info.content;
-                if (info.reasoning) reasoning += info.reasoning;
+        """)
+        + textwrap.indent(chunk_body, "        ")
+        + textwrap.dedent("""
             }
+            // ↑↑↑ 逐帧处理段结束
         """)
         + textwrap.indent(tail, "    ")
         + textwrap.dedent("""
             return { bubble: snap(aiBubble), messages: _pgMessages, reasoning, cleared,
-                     classified: frames.map(_pgClassifyChunk),
+                     classified: frames.map(_pgClassifyChunk), gotContent, stillWorking,
+                     sawStreamError: streamError !== null,
                      mode: outcome.mode, errorText: outcome.errorText };
         }
 
-        const frames = JSON.parse(process.argv[2]);
-        process.stdout.write(JSON.stringify(run(frames)));
+        const argv = JSON.parse(process.argv[2]);
+        process.stdout.write(JSON.stringify(run(argv.frames, argv.opts)));
         """)
     )
 
 
-def _run(frames, tmp_path: Path) -> dict:
+def _run(frames, tmp_path: Path, **opts) -> dict:
     script = tmp_path / "harness.mjs"
     script.write_text(_harness(), encoding="utf-8")
     proc = subprocess.run(
-        [_NODE, str(script), json.dumps(frames)],
+        [_NODE, str(script), json.dumps({"frames": frames, "opts": opts})],
         capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 0, f"node 执行失败:\n{proc.stderr}"
@@ -215,6 +247,34 @@ def test_error_after_content_appends_and_keeps_what_arrived(tmp_path):
     assert kids[1]["html"] is None
     # 已收到的内容仍然进历史，用户消息不弹回
     assert out["messages"][-1] == {"role": "assistant", "content": "partial answer"}
+
+
+@_needs_node
+def test_the_loop_itself_captures_the_error_frame(tmp_path):
+    """钉死 call site：逐帧循环必须真的把 error 帧记下来，而不是当普通帧吃掉。
+
+    防的正是"把循环里那几行删掉/改回旧写法，issue #11 原样复发而测试全绿"。
+    harness 跑的是从 app.js **原样切出来**的逐帧处理段（_extract_chunk_body），
+    所以这条断言直接落在真实调用点上。
+    """
+    out = _run([_delta(content="hi"), _err("boom", 503), _delta(content="ignored-after-error")], tmp_path)
+
+    assert out["sawStreamError"] is True, "error 帧没被循环捕获 —— 调用点被改坏了"
+    # 错误帧不参与正文累积，且不能把它自己变成正文
+    assert out["mode"] == "partial-error"
+    assert "boom" not in out["bubble"]["html"]
+    assert out["bubble"]["children"][-1]["text"] == "Gateway error (503): boom"
+
+
+@_needs_node
+def test_error_frame_alone_does_not_fall_back_to_no_content(tmp_path):
+    """issue #11 的原始截图场景：只有 error 帧时绝不能渲染成"无响应内容"。"""
+    out = _run([_err("upstream 503", 503)], tmp_path)
+
+    assert out["sawStreamError"] is True
+    assert out["gotContent"] is False
+    assert out["mode"] == "error"
+    assert out["bubble"]["text"] != "No response content"
 
 
 # --------------------------------------------------------------------------
