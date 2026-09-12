@@ -147,6 +147,32 @@ def test_release_failure_does_not_stamp_last_success_at():
     assert a.last_success_at is None
 
 
+def test_release_disconnected_does_not_stamp_last_success_at():
+    """断连（用户点"停止"）是高频路径，绝不能伪造"最近成功过"。
+
+    last_success_at 存在的唯一意义就是区分"真的吐出过内容"和"只是被派过活"——
+    在这条路径上打戳等于把 issue #11 的面板欺骗换个入口原样搬回来：
+    cookie 死透的账号只要用户点几次停止，面板就一直显示"刚刚成功过"。
+    """
+    a = _acc(client=_FakeClient(), active_requests=1)
+    asyncio.run(_pool(a).release_disconnected(a))
+
+    assert a.last_success_at is None
+    # 顺带钉死断连的中性语义：既不算成功也不算失败
+    assert a.consecutive_failures == 0
+    assert a.error_count == 0
+    assert a.status == AccountStatus.ACTIVE
+
+
+def test_release_disconnected_preserves_an_earlier_success_timestamp():
+    """反过来也不许抹掉：之前真成功过的时间戳得原样留着。"""
+    stamped = datetime.now(timezone.utc) - timedelta(hours=3)
+    a = _acc(client=_FakeClient(), active_requests=1, last_success_at=stamped)
+    asyncio.run(_pool(a).release_disconnected(a))
+
+    assert a.last_success_at == stamped
+
+
 def test_release_failure_records_redacted_summary():
     a = _acc(client=_FakeClient(), active_requests=1)
     pool = _pool(a)
@@ -295,9 +321,14 @@ def _i18n_account_keys() -> dict:
 
 
 def test_new_health_keys_exist_in_every_language():
+    # 这份名单防的是"五个语言块一起漏掉某个键"——那种情况下
+    # test_all_language_blocks_share_the_same_account_keys 的集合比较仍然相等、照样通过，
+    # 而面板会把 'accounts.emptyResponses' 这样的字面量键名直接渲染给用户看。
+    # 本批新增的键一个都不能漏在名单外。
     needed = {
         "accounts.health", "accounts.lastSuccess", "accounts.lastError",
         "accounts.healthMismatch", "accounts.sessionUnhealthy", "accounts.consecutiveFailures",
+        "accounts.emptyResponses", "accounts.consecutiveNow",
     }
     blocks = _i18n_account_keys()
     missing = {lang: sorted(needed - blocks[lang]) for lang in _LANGS if needed - blocks[lang]}
