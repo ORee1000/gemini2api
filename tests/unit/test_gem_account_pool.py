@@ -72,7 +72,7 @@ def test_generate_pinned_account_passes_gem_id():
         received_excludes.append(exclude)
         return a1
 
-    async def _fake_release(account, success, cooldown=False):
+    async def _fake_release(account, success, cooldown=False, **kwargs):
         pass
 
     pool.acquire = _fake_acquire
@@ -118,7 +118,7 @@ def test_generate_stream_pinned_account_passes_gem_id():
         received_excludes.append(exclude)
         return a1
 
-    async def _fake_release(account, success, cooldown=False):
+    async def _fake_release(account, success, cooldown=False, **kwargs):
         pass
 
     pool.acquire = _fake_acquire

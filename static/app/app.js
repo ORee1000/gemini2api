@@ -250,6 +250,33 @@ function _accountHealthNote(account) {
     return null;
 }
 
+// 与后端 app/core/account_pool.EMPTY_STREAK_THRESHOLD 对齐：连续空到这个数才算真的坏了
+const EMPTY_STREAK_THRESHOLD = 3;
+
+// 空响应提示（纯函数）。上游 HTTP 200 却一个字都没吐的次数，过去被当成成功，
+// 面板上 Errors 纹丝不动 —— "每次都吐空"的账号完全看不出来（issue #11）。
+// 从没空过就返回 null，不给正常账号添噪音。
+function _accountEmptyNote(account) {
+    const total = Number(account?.empty_count) || 0;
+    if (total <= 0) return null;
+    const streak = Number(account.consecutive_empty) || 0;
+    return {
+        cls: streak >= EMPTY_STREAK_THRESHOLD ? 'text-danger' : 'text-warning',
+        text: streak > 0 ? `${total} (${t('accounts.consecutiveNow')} ${streak})` : String(total)
+    };
+}
+
+// 空响应渲染成一行 account-detail；无提示时返回空串。
+function _accountEmptyRow(account) {
+    const note = _accountEmptyNote(account);
+    if (!note) return '';
+    return `
+            <div class="account-detail">
+                <span class="label">${t('accounts.emptyResponses')}</span>
+                <span class="value ${note.cls}">${escapeHtml(note.text)}</span>
+            </div>`;
+}
+
 // 健康提示渲染成一行 account-detail；无提示时返回空串（不占位）。
 // 注意：note.text 里可能拼进后端来的数字，统一走 escapeHtml。
 function _accountHealthRow(account) {
@@ -297,7 +324,7 @@ function renderAccountStatusGrid(accounts) {
             <div class="account-detail">
                 <span class="label">${t('accounts.lastSuccess')}</span>
                 <span class="value">${escapeHtml(formatDate(account.last_success_at))}</span>
-            </div>${_accountHealthRow(account)}
+            </div>${_accountHealthRow(account)}${_accountEmptyRow(account)}
         </div>
     `).join('');
 }
@@ -400,7 +427,7 @@ async function loadAccounts() {
                     <span class="label">${t('accounts.lastSuccess')}</span>
                     <span class="value">${escapeHtml(formatDate(account.last_success_at))}</span>
                 </div>
-    ${_accountHealthRow(account)}
+    ${_accountHealthRow(account)}${_accountEmptyRow(account)}
                 ${account.last_error ? `
                 <div class="account-detail">
                     <span class="label">${t('accounts.lastError')}</span>

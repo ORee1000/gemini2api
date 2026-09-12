@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from app.core.gemini_client import GeminiWebClient, HTTPStatusError, NO_HEALTHY_ACCOUNT_MSG
+from app.core.fallback import is_empty_result
 from app.config import settings
 from app.core.usage_metrics import live_metrics
 from app.utils.atomic_io import atomic_write_text
@@ -23,6 +24,10 @@ HEAL_RETRY_COOLDOWN = 60.0
 # 网络 I/O，正常情况下这个标志活不过那么久；万一某条路径（未来的新 bug）没能在结束时
 # 清掉它，超过这个阈值就当陈旧、可回收 —— 双保险，绝不指望它成为常态触发路径。
 HEALING_STALE_SECONDS = 120.0
+
+# 连续多少次空响应才允许在面板的 Errors 上留痕（issue #11）。单次空响应太常见
+# （内容拒答、被安全策略拦下），不足以说明账号坏了，所以单次绝不降级账号。
+EMPTY_STREAK_THRESHOLD = 3
 
 
 def _is_5xx(exc: Exception) -> bool:
@@ -43,6 +48,19 @@ def _is_retryable(exc: Exception) -> bool:
     if isinstance(exc, HTTPStatusError) and exc.status_code in (401, 403):
         return True
     return False
+
+
+def _is_empty_generation(result) -> bool:
+    """这一次生成是不是「上游 200 但什么都没产出」。
+
+    在 is_empty_result()（fallback 的口径：无 text 且无 images）之上多放过一种情况：
+    只有思考链、没有正文。那种回复上游确实生成了东西、会话是活的，用户勾了 thinking
+    时也确实会出现，不该记进空响应计数器 —— 这个计数器宁可漏报也不能误伤。
+    is_empty_result() 本身一个字都不改：它还被 fallback 判定复用，口径不能动。
+    """
+    if not is_empty_result(result):
+        return False
+    return not (isinstance(result, dict) and (result.get("thoughts") or "").strip())
 
 
 def _error_summary(exc: Exception) -> str:
@@ -91,6 +109,11 @@ class Account:
     # 最近一次失败的安全摘要（见 _error_summary：只留异常类型 + HTTP 状态码，不留原文）
     last_error: str = ""
     last_error_at: datetime | None = None
+    # 空响应（上游 HTTP 200 却解析不出任何内容）计数。issue #11：这类响应过去被
+    # release(success=True) 当成成功，Errors 纹丝不动、consecutive_failures 还被清零，
+    # 于是"每次都吐空"的账号在面板上完全看不出来。
+    consecutive_empty: int = 0
+    empty_count: int = 0
     # 被 5xx/503 限流后的冷却截止时间戳（loop.time()）；冷却期内不优先选，但不算 expired
     cooldown_until: float = 0.0
     # 会话自愈（reload_cookies）的单飞标志：为真表示已有请求在锁外跑自愈，其余并发请求
@@ -332,6 +355,8 @@ class AccountPool:
         async with self._cond:
             if ok:
                 account.consecutive_failures = 0
+                # 换了新 cookie 就是换了个会话，旧会话的空响应 streak 不该继承
+                account.consecutive_empty = 0
                 logger.info(f"Account {account.id} self-healed: cookies reloaded")
                 # 多出了可用槽位，唤醒所有排队者重新评估
                 self._cond.notify_all()
@@ -448,16 +473,41 @@ class AccountPool:
             # 回到外层循环重新取锁、重新 _find_available()：
             # 自愈成功 → 直接拿到槽位；失败/超预算 → 下一轮走上面的 NO_HEALTHY_ACCOUNT_MSG 分支。
 
-    async def release(self, account: Account, success: bool, cooldown: bool = False, *, error: str = ""):
-        """error 是 _error_summary() 出来的安全摘要（keyword-only + 默认空串，既有调用点行为不变）。"""
+    async def release(self, account: Account, success: bool, cooldown: bool = False, *,
+                      error: str = "", empty: bool = False):
+        """error / empty 都是 keyword-only 且有默认值，既有调用点行为逐字节不变。
+
+        error：_error_summary() 出来的安全摘要。
+        empty：这次生成上游返回了 200 但没产出任何内容（见 _is_empty_generation）。
+        """
         async with self._cond:
             account.active_requests = max(0, account.active_requests - 1)
             account.request_count += 1
             if not success and error:
                 account.last_error = error
                 account.last_error_at = datetime.now(timezone.utc)
-            if success:
+            if success and empty:
+                # 空响应：只累计，单次绝不降级账号（内容拒答之类的正常情况长得一模一样）。
+                # 刻意不碰 status / cooldown_until / consecutive_failures，也刻意不打
+                # last_success_at —— 吐了个空并不能证明这个会话还活着，不该替真实失败擦屁股。
+                account.consecutive_empty += 1
+                account.empty_count += 1
+                if account.consecutive_empty >= EMPTY_STREAK_THRESHOLD:
+                    # 连着空到阈值才在面板可见的 Errors 上留痕，并持续增长，
+                    # 让"卡在空响应里"的账号一眼看得出还在恶化。
+                    account.error_count += 1
+                    account.last_error = (
+                        f"Empty response x{account.consecutive_empty} (upstream 200, no content)"
+                    )
+                    account.last_error_at = datetime.now(timezone.utc)
+                    logger.warning(
+                        f"Account {account.id} returned {account.consecutive_empty} consecutive "
+                        f"empty responses (upstream 200, no content)"
+                    )
+            elif success:
                 account.consecutive_failures = 0
+                # 只有真吐出了内容才算证明会话是活的 —— 这是唯一的清零点
+                account.consecutive_empty = 0
                 account.last_success_at = datetime.now(timezone.utc)
             elif cooldown:
                 # 5xx/503 限流：不是账号坏，只是被 Google 临时限流。
@@ -670,6 +720,8 @@ class AccountPool:
                 # models_count 只要 client 对象在就恒等于公开模型数，同样证明不了会话还活着。
                 "is_healthy": bool(a.client is not None and a.client.is_healthy),
                 "consecutive_failures": a.consecutive_failures,
+                "consecutive_empty": a.consecutive_empty,
+                "empty_count": a.empty_count,
                 "last_success_at": a.last_success_at.isoformat() if a.last_success_at else None,
                 # 安全摘要，不含上游原文（见 _error_summary）
                 "last_error": a.last_error,
@@ -717,7 +769,7 @@ class AccountPool:
                 result = await account.client.generate(prompt, model, conversation_id, attachments, gem_id,
                                                         extended_thinking)
                 live_metrics.record_request(model, (time.time() - t0) * 1000)
-                await self.release(account, success=True)
+                await self.release(account, success=True, empty=_is_empty_generation(result))
                 released = True
                 return result
             except (asyncio.CancelledError, GeneratorExit):
@@ -778,13 +830,28 @@ class AccountPool:
             emitted_any = False
             failover = False
             released = False
+            # 判空只看这三个，且必须等流跑完再判：帧是累积式的，中途任何一帧都可能没文本，
+            # 而 final.text 才是过滤完占位串的权威全文。emitted_any 不能复用来判空——
+            # 它对任何事件（包括 text="" 的 final）都置 True，零鉴别力。
+            saw_text = False
+            saw_thoughts = False
+            final_evt = None
             try:
                 async for evt in account.client.generate_stream(prompt, model, conversation_id, attachments, gem_id,
                                                                   extended_thinking):
                     emitted_any = True
+                    evt_type = evt.get("type") if isinstance(evt, dict) else None
+                    if evt_type == "delta" and (evt.get("text") or "").strip():
+                        saw_text = True
+                    elif evt_type == "thoughts" and (evt.get("text") or "").strip():
+                        saw_thoughts = True
+                    elif evt_type == "final":
+                        final_evt = evt
                     yield evt
                 live_metrics.record_request(model, (time.time() - t0) * 1000)
-                await self.release(account, success=True)
+                # final 事件压根没来（上游中途静默截断）也算空：is_empty_result(None) 为真
+                stream_empty = not saw_text and not saw_thoughts and _is_empty_generation(final_evt)
+                await self.release(account, success=True, empty=stream_empty)
                 released = True
                 return
             except (asyncio.CancelledError, GeneratorExit):
