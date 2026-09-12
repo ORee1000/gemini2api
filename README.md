@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/Chrome%20%7C%20Edge-Latest-4285F4?style=flat-square&logo=googlechrome&logoColor=white" alt="Browser">
   <img src="https://img.shields.io/badge/License-Non--Commercial-red?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v1.6.39-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v1.6.40-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-09-12 10:15:00 | v1.6.40 - 🔍 修复「模型测试页把真实错误显示成『无响应内容』」（issue #11 追加）：流式失败只能以流内 error 帧表达，而前端不认这个键，导致 503/529/500/400 全长一样；现在显示真实原因与状态码，已输出的内容不会被抹掉。账号卡片新增真实健康信息（`is_healthy`／连续失败数／最近成功时间／脱敏后的最近错误）—— 此前绿色 ACTIVE 徽章读的是池里的状态枚举而非客户端健康位，cookie 失效的账号照样显示绿色。空响应不再被当成功悄悄咽下（连续 3 次才计入错误，单次绝不降级）。启动日志明说 cookie 轮换循环有没有起来 |
 | 2026-09-01 16:20:00 | v1.6.39 - ⚙️ `LOG_BODIES_ENABLED` 接入管理面板「日志」分组，点一下即时生效、无需改配置重启（默认仍关）；⚠️ 行为变更：面板保存过的设置项现在落盘 `data/settings-overrides.json` 并**优先于环境变量**（此前面板改完一重启就被打回）；修复面板小数字段被 `parseInt` 静默截断、拒绝 NaN/±Infinity 写入、写盘失败时三层（内存/覆盖文件/.env）全有或全无回滚；补齐面板里显示成原始字段名/写死中文的标签并加守卫测试 |
 | 2026-09-01 13:10:00 | v1.6.38 - 🍪 修复「同名 Cookie 跨域并存」（Google 重定向到 .com.hk 等国家域名时）导致会话获取整体失败、账号被误标不健康（issue #10 追加；也是 issue #11 卡死的真实触发源之一）；工具调用 JSON 畸形时自动重新生成一次（重试期间有流式保活）；新增可开关的完整请求/响应记录 `LOG_BODIES_ENABLED`（默认关，只存内存不写盘、不记请求头） |
 | 2026-08-30 18:20:00 | v1.6.37 - 🩺 修复账号池永久卡死并误报「All accounts busy」（issue #11）：会话失效的账号此前会让每个请求空等 60 秒并返回错误的 529，现改为立即返回准确的 503 并**自动尝试重载 cookie 自愈**；客户端断连不再被计为账号失败（点 3 次「停止」曾能让单账号池瘫痪）；cookie 重载失败不再永久拉黑健康账号 |
@@ -70,7 +71,6 @@
 | 2026-08-28 14:20:00 | v1.6.33 - 🔌 修复 Claude Code 无法接入（issue #10）：`system` 支持文本块数组不再 422；`tool_use`/`tool_result` 块不再被丢弃（工具循环可用）；Anthropic 流式改为标准 event+data 两行制；并给 Claude buffered 流式补保活、断连及时归还账号槽位 |
 | 2026-08-14 22:50:00 | v1.6.32 - 🧠 思考内容逐帧流式：原生 Gemini 的思考过程在生成阶段就作为 reasoning_content 逐帧增量流出（/v1/chat/completions），思考先于答案显示、带打字机效果，修复面板「答案早于思考」；收尾仍带完整思考兜底，不开思考/普通对话零回归 |
 | 2026-08-14 22:40:00 | v1.6.31 - 🌊 修复流式连接偶发中断：为全部四条流式接口（/v1/chat/completions、/v1/responses、/v1/messages、native Gemini streamGenerateContent）在等待模型生成的静默期补发保活心跳，避免长响应被跨境/网关空闲超时掐断；并修正面板误导的网络错误提示 |
-| 2026-08-14 22:30:00 | v1.6.30 - 🧠 模型测试面板新增「思考」开关：勾选后对 Gemini 开启扩展思考，思考过程以可折叠块显示在答案上方 |
 
 ---
 

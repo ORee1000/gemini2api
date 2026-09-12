@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/Chrome%20%7C%20Edge-Latest-4285F4?style=flat-square&logo=googlechrome&logoColor=white" alt="Browser">
   <img src="https://img.shields.io/badge/License-Non--Commercial-red?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v1.6.39-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v1.6.40-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-09-12 10:15:00 | v1.6.40 - 🔍 修復「模型測試頁把真實錯誤顯示成『無回應內容』」（issue #11 追加）：串流失敗只能以串流內 error 幀表達，而前端不認這個鍵，導致 503/529/500/400 全長一樣；現在顯示真實原因與狀態碼，已輸出的內容不會被抹掉。帳號卡片新增真實健康資訊（`is_healthy`／連續失敗數／最近成功時間／去敏後的最近錯誤）—— 此前綠色 ACTIVE 徽章讀的是池裡的狀態列舉而非用戶端健康位，cookie 失效的帳號照樣顯示綠色。空回應不再被當成功悄悄嚥下（連續 3 次才計入錯誤，單次絕不降級）。啟動日誌明說 cookie 輪換迴圈有沒有起來 |
 | 2026-09-01 16:20:00 | v1.6.39 - ⚙️ `LOG_BODIES_ENABLED` 接進管理面板「日誌」分組，點一下即時生效、無需改設定重啟（預設仍關）；⚠️ 行為變更：面板儲存過的設定項現在寫入 `data/settings-overrides.json` 並**優先於環境變數**（此前面板改完一重啟就被打回）；修復面板小數欄位被 `parseInt` 靜默截斷、拒絕 NaN/±Infinity 寫入、寫入失敗時三層（記憶體/覆寫檔/.env）全有或全無回復；補齊面板裡顯示成原始欄位名／寫死中文的標籤並加守衛測試 |
 | 2026-09-01 13:10:00 | v1.6.38 - 🍪 修復「同名 Cookie 跨網域並存」（Google 重新導向到 .com.hk 等國家網域時）導致工作階段取得整體失敗、帳號被誤標不健康（issue #10 追加；也是 issue #11 卡死的真實觸發源之一）；工具呼叫 JSON 畸形時自動重新產生一次（重試期間有串流保活）；新增可開關的完整請求/回應記錄 `LOG_BODIES_ENABLED`（預設關，只存記憶體不寫磁碟、不記請求標頭） |
 | 2026-08-30 18:20:00 | v1.6.37 - 🩺 修復帳號池永久卡死並誤報「All accounts busy」（issue #11）：工作階段失效的帳號此前會讓每個請求空等 60 秒並回傳錯誤的 529，現改為立即回傳準確的 503 並**自動嘗試重載 cookie 自癒**；用戶端斷線不再計為帳號失敗；cookie 重載失敗不再永久封鎖健康帳號 |
@@ -70,7 +71,6 @@
 | 2026-08-28 14:20:00 | v1.6.33 - 🔌 修復 Claude Code 無法接入（issue #10）：`system` 支援文字區塊陣列不再 422；`tool_use`/`tool_result` 區塊不再被丟棄（工具迴圈可用）；Anthropic 串流改為標準 event+data 兩行制；並為 Claude buffered 串流補保活、斷線及時歸還帳號槽位 |
 | 2026-08-14 22:50:00 | v1.6.32 - 🧠 思考內容逐幀串流：原生 Gemini 的思考過程在生成階段就作為 reasoning_content 逐幀增量流出（/v1/chat/completions），思考先於答案顯示、帶打字機效果，修復面板「答案早於思考」；收尾仍帶完整思考兜底，不開思考/一般對話零回歸 |
 | 2026-08-14 22:40:00 | v1.6.31 - 🌊 修復串流連線偶發中斷：為全部四條串流介面（/v1/chat/completions、/v1/responses、/v1/messages、native Gemini streamGenerateContent）在等待模型生成的靜默期補發保活心跳，避免長回應被跨境/閘道閒置逾時掐斷；並修正面板誤導的網路錯誤提示 |
-| 2026-08-14 22:30:00 | v1.6.30 - 🧠 模型測試面板新增「思考」開關：勾選後對 Gemini 開啟擴展思考，思考過程以可折疊塊顯示在答案上方 |
 
 ---
 
