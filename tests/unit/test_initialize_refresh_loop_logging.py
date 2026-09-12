@@ -40,8 +40,32 @@ def _client(monkeypatch, tmp_path, *, token: str) -> tuple[gc.GeminiWebClient, l
     ensured = []
     monkeypatch.setattr(client, "_obtain_session_token", _obtain)
     monkeypatch.setattr(client, "_send_heartbeat", _heartbeat)
-    monkeypatch.setattr(client, "_ensure_refresh_task", lambda: ensured.append(True))
+
+    # 只拦住"真的创建后台任务"这一步，_ensure_refresh_task 本体照跑 —— 它自己也会打一句
+    # "Auto-refresh loop started"。以前这里把整个方法 stub 掉，于是测试看不见它的日志，
+    # 生产上两句一起打（重复条目）也照样全绿。
+    def _fake_create_task(coro, *a, **kw):
+        coro.close()  # 别让协程留下 "never awaited" 警告
+        return _DummyTask()
+
+    monkeypatch.setattr(gc.asyncio, "create_task", _fake_create_task)
+
+    real_ensure = client._ensure_refresh_task
+
+    def _spy():
+        ensured.append(True)
+        return real_ensure()
+
+    monkeypatch.setattr(client, "_ensure_refresh_task", _spy)
     return client, ensured
+
+
+class _DummyTask:
+    def done(self):
+        return False
+
+    def cancel(self):
+        return None
 
 
 class _DummyJar:
@@ -83,10 +107,11 @@ def test_tokenless_startup_says_the_loop_started_and_why(monkeypatch, tmp_path, 
 
     msgs = _messages(_caplog_info)
     hits = [m for m in msgs if "Auto-refresh loop" in m]
-    assert len(hits) == 1, f"启动必须恰好说一次轮换循环的状态，实际: {hits}"
+    assert len(hits) == 1, f"启动必须恰好说一次轮换循环的状态（不许重复），实际: {hits}"
     assert "NOT started" not in hits[0]
     assert "started" in hits[0]
-    assert "startup token missing" in hits[0], "还得说清楚为什么启动了"
+    # 原因由紧挨着的上一条 warning 说清楚，不再重复打一句 started
+    assert any("Token not found" in m for m in msgs), "还得说清楚为什么启动了"
 
     # 控制流未变：拿不到 token 才调 _ensure_refresh_task
     assert ensured == [True]

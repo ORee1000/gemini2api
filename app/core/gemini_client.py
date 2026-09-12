@@ -483,9 +483,12 @@ class GeminiWebClient:
                 "after a failed start or a manual cookie reload)"
             )
         else:
+            # 这条分支不再另打一句「started」：_ensure_refresh_task() 自己就会打
+            # 「Auto-refresh loop started」，紧挨着上面那条 warning 已经把原因说清楚了。
+            # 两句都打的话 grep 'Auto-refresh loop started' 会出现重复条目，
+            # 反而让人误以为循环被启动了两次 —— 而这一批的全部价值就是让日志说清楚。
             logger.warning("Token not found, rotating cookies")
             self._ensure_refresh_task()
-            logger.info("Auto-refresh loop started (startup token missing)")
 
         if settings.health_check_enabled:
             self._health_check_task = asyncio.create_task(self._health_check_loop())
