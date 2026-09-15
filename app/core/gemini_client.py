@@ -316,6 +316,41 @@ def _scan_complete_wrb_frames(buf: str) -> tuple[list, int]:
     return frames, consumed
 
 
+
+def _raise_wrb_error(frame) -> None:
+    """Surface typed upstream failures, without copying private response bodies.
+
+    A wrb.fr with no payload may carry google.rpc.Status in field 5. Only
+    typed Bard errors are fatal here; ordinary queue/progress frames are not.
+    Preserve unknown Bard codes rather than guessing their account meaning.
+    """
+    if not isinstance(frame, list) or len(frame) < 6 or frame[0] != "wrb.fr":
+        return
+    status = frame[5]
+    if not isinstance(status, list) or len(status) < 3:
+        return
+    details = status[2]
+    if not isinstance(details, list):
+        return
+    for detail in details:
+        if not isinstance(detail, list) or len(detail) < 2:
+            continue
+        if detail[0] != "type.googleapis.com/assistant.boq.bard.application.BardErrorInfo":
+            continue
+        codes = detail[1]
+        if not isinstance(codes, list) or not codes or type(codes[0]) is not int or codes[0] <= 0:
+            continue
+        rpc = status[0] if type(status[0]) is int else None
+        # google.rpc.Code RESOURCE_EXHAUSTED maps to HTTP 429. This does not
+        # establish whether Bard's private subcode means quota, capacity or policy.
+        http = 429 if rpc == 8 else 502
+        name = " RESOURCE_EXHAUSTED" if rpc == 8 else ""
+        error = HTTPStatusError(http, f"Gemini Web upstream RPC {rpc}{name}; BardErrorInfo {codes[0]}.")
+        error.upstream_rpc_status = rpc
+        error.upstream_bard_code = codes[0]
+        raise error
+
+
 def _extract_text_from_wrb(elem: list) -> tuple[str | None, str, str]:
     """从单个 wrb.fr 帧提取 (累积文本, 会话ID, 思维链)。非文本帧返回 (None, "", "")。
     文本路径 payload[4][0][1][0]；会话ID 用 str(payload[1])，与非流式 _parse_output
@@ -323,6 +358,7 @@ def _extract_text_from_wrb(elem: list) -> tuple[str | None, str, str]:
     流式与非流式必须同格式，否则多轮对话续接会错乱）。思维链路径 payload[4][0][37][0][0]
     （extended thinking 开启时才有，与 _parse_output 保持一致）。
     """
+    _raise_wrb_error(elem)
     try:
         if not isinstance(elem, list) or len(elem) < 3 or elem[0] != "wrb.fr":
             return None, "", ""
@@ -414,6 +450,19 @@ def _rand_reqid() -> int:
     return random.randint(10000, 99999)
 
 
+
+
+# Measured Gemini Web Flash input boundary, distinct from API token capacity.
+_WEB_FLASH_PROMPT_CHAR_LIMIT = 1_000_000
+
+
+def _validate_web_prompt(prompt: str, model: str) -> None:
+    family = _PUBLIC_FAMILY.get(MODEL_ALIASES.get(model, model))
+    if family in {"flash", "flash-thinking"} and len(prompt) > _WEB_FLASH_PROMPT_CHAR_LIMIT:
+        raise HTTPStatusError(400,
+            "context length exceeded: Gemini Web Flash prompt exceeds the supported "
+            f"{_WEB_FLASH_PROMPT_CHAR_LIMIT} character transport limit "
+            f"(received {len(prompt)} characters, including history and tools).")
 
 class GeminiWebClient:
     def __init__(self, psid: str | None = None, psidts: str | None = None):
@@ -1128,6 +1177,7 @@ class GeminiWebClient:
     async def generate(self, prompt: str, model: str, conversation_id: str = "",
                        attachments: list | None = None, gem_id: str | None = None,
                        extended_thinking: bool = False) -> dict:
+        _validate_web_prompt(prompt, model)
         if not self._healthy:
             # 单账号自愈：抛错前单飞重载一次 Cookie，缓解会话约 2h 到期后的硬失败（Issue#1-C）
             async with self._heal_lock:
@@ -1194,6 +1244,7 @@ class GeminiWebClient:
         - 流式 timeout 可能失效（#215），故用 asyncio.wait_for 兜底每个 chunk 的等待。
         - 帧是累积式，逐帧 diff 出增量。生图/附件场景在最后帧统一处理。
         """
+        _validate_web_prompt(prompt, model)
         if not self._healthy:
             # 单账号自愈：抛错前单飞重载一次 Cookie（Issue#1-C）
             async with self._heal_lock:
@@ -1501,6 +1552,7 @@ class GeminiWebClient:
                 continue
 
             for item in data:
+                _raise_wrb_error(item)
                 if not isinstance(item, list) or len(item) < 3:
                     continue
                 raw_payload = item[2]

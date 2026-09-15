@@ -13,7 +13,7 @@ from app.core.account_pool import account_pool as gemini_client
 from app.core.api_forwarder import forward_to_provider, open_stream
 from app.core.fallback import fallback_enabled, is_empty_result, get_fallback_entries, openai_data_is_empty
 from app.core.conversation_store import conversation_store
-from app.core.gemini_client import GEMINI_MODELS, MODEL_ALIASES, _resolve_model, HTTPStatusError, classify_error
+from app.core.gemini_client import _PUBLIC_FAMILY, GEMINI_MODELS, MODEL_ALIASES, _resolve_model, HTTPStatusError, classify_error
 from app.core.stream import split_into_chunks, format_sse, iter_with_keepalive, SSE_KEEPALIVE_INTERVAL, SSE_KEEPALIVE_FRAME, sse_keepalive_during
 from app.models.openai import (
     ChatRequest, ChatResponse, Choice, ChoiceMessage,
@@ -21,12 +21,18 @@ from app.models.openai import (
     ModelList, ModelInfo, UsageInfo,
     ImageGenerationRequest, ImageData, ImageResponse,
 )
-from app.utils.tools import build_tool_prompt, parse_tool_response_with_retry, estimate_tokens, is_image_generation_intent, maybe_image_generation_intent
+from app.utils.tools import validate_tool_result, build_tool_prompt, parse_tool_response_with_retry, estimate_tokens, is_image_generation_intent, maybe_image_generation_intent
 from app.utils.prompt import build_prompt_from_messages, extract_attachments, last_user_text
 from app.core.limiter import limiter, dynamic_rate_limit, rate_limit_exempt
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["OpenAI"])
+
+
+def _resource_failure(exc: Exception) -> bool:
+    """Changing request mode/history cannot repair an explicit resource failure."""
+    return isinstance(exc, HTTPStatusError) and (exc.status_code == 429 or 500 <= exc.status_code < 600)
+
 
 
 def _apply_model_whitelist(models: list[str]) -> list[str]:
@@ -301,12 +307,12 @@ async def chat_completions(req: ChatRequest, request: Request):
     else:
         prompt = build_prompt_from_messages(messages_raw)
 
-    has_tools = bool(req.tools)
+    has_tools = bool(req.tools) and req.tool_choice != "none"
     # 生图意图优先：即使带 tools（agent 每请求都带），只要是明确生图意图就跳过工具模拟，
     # 直接走生图，否则工具 prompt 会压制 Gemini 的图片生成能力。
     # 只看最后一轮用户消息：prompt 可能是整段历史（含 system 与 tool_result 正文），
     # 拿它判断会误判成生图并静默丢掉客户端 tools。
-    if has_tools and is_image_generation_intent(last_user_text(messages_raw)):
+    if has_tools and req.tool_choice in (None, "auto", "none") and is_image_generation_intent(last_user_text(messages_raw)):
         has_tools = False
         logger.info("检测到生图意图，跳过工具调用模拟，直接生图")
     if has_tools:
@@ -318,7 +324,11 @@ async def chat_completions(req: ChatRequest, request: Request):
 
     # reasoning_effort（非空）+ 全局开关 → 走扩展思维链路径
     _eff = (req.reasoning_effort or "").strip()
-    extended_thinking = bool(_eff) and settings.extended_thinking_enabled
+    family = _PUBLIC_FAMILY.get(MODEL_ALIASES.get(resolved_model, resolved_model))
+    # Explicit Flash selection must not be upgraded by a client's default effort.
+    extended_thinking = (bool(_eff) and _eff.lower() not in {"none", "off", "disabled"}
+                         and family not in {"flash", "flash-lite"}
+                         and settings.extended_thinking_enabled)
 
     if req.stream:
         return StreamingResponse(
@@ -335,7 +345,7 @@ async def chat_completions(req: ChatRequest, request: Request):
         err = e
         result = None
         # 扩展思维链路径失败：先原样退回非思维链重试一次，再走既有兜底（会话过期/第三方）
-        if extended_thinking:
+        if extended_thinking and not _resource_failure(e):
             logger.warning(f"extended-thinking request failed, retrying normal: {e}")
             try:
                 result = await gemini_client.generate(prompt, resolved_model, gemini_conv_id, attachments,
@@ -346,7 +356,7 @@ async def chat_completions(req: ChatRequest, request: Request):
 
         if result is None:
             # Fallback: 如果 conversation_id 过期，用完整 prompt 重试
-            if gemini_conv_id:
+            if gemini_conv_id and not _resource_failure(err):
                 prompt = build_prompt_from_messages(messages_raw)
                 if has_tools:
                     tools_raw = [t.model_dump() for t in req.tools]
@@ -356,7 +366,8 @@ async def chat_completions(req: ChatRequest, request: Request):
                                                            gem_id=gem_id, account_id=gem_account_id,
                                                            extended_thinking=False)
                     gemini_conv_id = ""
-                except Exception:
+                except Exception as recovery_error:
+                    err = recovery_error
                     fb = await _fallback_result(request, req, messages_raw, resolved_model)
                     if fb is not None:
                         return JSONResponse(content=fb)
@@ -384,6 +395,9 @@ async def chat_completions(req: ChatRequest, request: Request):
         fb = await _fallback_result(request, req, messages_raw, resolved_model)
         if fb is not None:
             return JSONResponse(content=fb)
+        return JSONResponse(status_code=502, content={"error": {
+            "message": "Gemini upstream returned no usable answer.",
+            "type": "api_error", "code": "upstream_empty_response"}})
 
     text = result.get("text", "")
     # AI 生成图片：图片在前，紧跟文字描述（单换行，不留多余空行）
@@ -393,6 +407,30 @@ async def chat_completions(req: ChatRequest, request: Request):
         text = (md + "\n" + text.strip()) if text.strip() else md
     new_conv_id = result.get("conversation_id", "")
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+    if has_tools:
+        async def _regenerate_for_tools() -> str:
+            nonlocal result, text, new_conv_id
+            r = await gemini_client.generate(prompt, resolved_model, gemini_conv_id, attachments,
+                                             gem_id=gem_id, account_id=gem_account_id,
+                                             extended_thinking=extended_thinking)
+            result = r
+            text = r.get("text", "")
+            new_conv_id = r.get("conversation_id", "")
+            return text
+
+        try:
+            parsed = await parse_tool_response_with_retry(text, _regenerate_for_tools, propagate_errors=True)
+        except Exception as exc:
+            status, err_type, retry_after = classify_error(exc)
+            return JSONResponse(status_code=status, content={"error": {
+                "message": str(exc), "type": err_type}},
+                headers={"Retry-After": str(retry_after)} if retry_after else None)
+        contract_error = validate_tool_result(parsed, [t.model_dump() for t in req.tools], req.tool_choice)
+        if contract_error:
+            return JSONResponse(status_code=502, content={"error": {
+                "message": "Gemini upstream tool contract failed: " + contract_error,
+                "type": "api_error", "code": "upstream_tool_contract"}})
 
     # 持久化对话
     if new_conv_id:
@@ -408,13 +446,6 @@ async def chat_completions(req: ChatRequest, request: Request):
         await conversation_store.update(conv)
 
     if has_tools:
-        async def _regenerate_for_tools() -> str:
-            r = await gemini_client.generate(prompt, resolved_model, gemini_conv_id, attachments,
-                                             gem_id=gem_id, account_id=gem_account_id,
-                                             extended_thinking=extended_thinking)
-            return r.get("text", "")
-
-        parsed = await parse_tool_response_with_retry(text, _regenerate_for_tools)
         if parsed["type"] == "tool_calls":
             tool_calls = []
             for i, tc in enumerate(parsed["tool_calls"]):
@@ -431,7 +462,8 @@ async def chat_completions(req: ChatRequest, request: Request):
                 id=completion_id,
                 model=req.model,
                 choices=[Choice(
-                    message=ChoiceMessage(role="assistant", tool_calls=tool_calls),
+                    message=ChoiceMessage(role="assistant", tool_calls=tool_calls,
+                                          reasoning_content=result.get("thoughts") or None),
                     finish_reason="tool_calls",
                 )],
                 usage=UsageInfo(
@@ -470,7 +502,8 @@ async def _stream_response(prompt: str, model: str, has_tools: bool, gemini_conv
     if has_tools or attachments or maybe_image_generation_intent(prompt):
         async for sse in _stream_response_buffered(
             prompt, model, has_tools, gemini_conv_id, conv, messages_raw,
-            model_name, completion_id, attachments, base_url, request, req, gem_id, account_id
+            model_name, completion_id, attachments, base_url, request, req, gem_id, account_id,
+            extended_thinking=extended_thinking
         ):
             yield sse
         return
@@ -537,6 +570,7 @@ async def _stream_response(prompt: str, model: str, has_tools: bool, gemini_conv
                     tail = final_text[len(full_text):]
                     full_text = final_text
                     if tail:
+                        streamed_any = True
                         chunk = StreamChunk(
                             id=completion_id, model=model_name,
                             choices=[StreamChoice(delta=StreamDelta(content=tail))],
@@ -548,18 +582,26 @@ async def _stream_response(prompt: str, model: str, has_tools: bool, gemini_conv
                 final_images = evt.get("images") or []
     except Exception as e:
         # 流式失败：会话ID 过期等场景，用完整 prompt 非流式重试一次
-        if gemini_conv_id and messages_raw and not streamed_any:
+        if gemini_conv_id and messages_raw and not streamed_any and not emitted_thoughts and not _resource_failure(e):
             try:
                 retry_prompt = build_prompt_from_messages(messages_raw)
                 result = await gemini_client.generate(retry_prompt, model, "", attachments,
                                                       gem_id=gem_id, account_id=account_id,
-                                                      extended_thinking=False)
+                                                      extended_thinking=extended_thinking)
                 full_text = result.get("text", "")
                 new_conv_id = result.get("conversation_id", "")
                 final_images = result.get("images") or []
+                emitted_thoughts = result.get("thoughts") or ""
+                if emitted_thoughts or full_text:
+                    streamed_any = bool(full_text)
+                    yield format_sse(StreamChunk(
+                        id=completion_id, model=model_name,
+                        choices=[StreamChoice(delta=StreamDelta(
+                            content=full_text or None, reasoning_content=emitted_thoughts or None))],
+                    ).model_dump())
             except Exception as e2:
                 # 尚未流出任何内容（只发过 role 首帧）→ 可安全改用第三方兜底（流式）
-                if not streamed_any:
+                if not streamed_any and not emitted_thoughts:
                     emitted = False
                     async for chunk in _maybe_fallback_stream(request, req, messages_raw, model, completion_id, model_name):
                         emitted = True
@@ -569,7 +611,7 @@ async def _stream_response(prompt: str, model: str, has_tools: bool, gemini_conv
                 yield _err_chunk(e2)
                 return
         else:
-            if not streamed_any:
+            if not streamed_any and not emitted_thoughts:
                 emitted = False
                 async for chunk in _maybe_fallback_stream(request, req, messages_raw, model, completion_id, model_name):
                     emitted = True
@@ -581,12 +623,15 @@ async def _stream_response(prompt: str, model: str, has_tools: bool, gemini_conv
 
     # Gemini 真流式整条为空（只发过 role 首帧，未流出任何内容）→ 第三方兜底
     if not streamed_any and not (full_text or "").strip() and not final_images:
-        emitted = False
-        async for chunk in _maybe_fallback_stream(request, req, messages_raw, model, completion_id, model_name):
-            emitted = True
-            yield chunk
-        if emitted:
-            return
+        if not emitted_thoughts:
+            emitted = False
+            async for chunk in _maybe_fallback_stream(request, req, messages_raw, model, completion_id, model_name):
+                emitted = True
+                yield chunk
+            if emitted:
+                return
+        yield _err_chunk(HTTPStatusError(502, "Gemini upstream returned no usable answer."))
+        return
 
     # 生图兜底：极少数生图意图未被识别而走了真流式（文字已先流出，无法把图收回到最前）。
     # 此时图片在最后帧拿到，补发图片增量；用单换行紧凑拼接，保证图能独立成行正常显示。
@@ -629,7 +674,7 @@ def _err_chunk(exc: Exception) -> str:
     return format_sse(chunk) + "data: [DONE]\n\n"
 
 
-async def _stream_response_buffered(prompt: str, model: str, has_tools: bool, gemini_conv_id: str = "", conv=None, messages_raw=None, model_name: str = "", completion_id: str = "", attachments=None, base_url: str = "", request=None, req=None, gem_id=None, account_id=None) -> AsyncGenerator[str, None]:
+async def _stream_response_buffered(prompt: str, model: str, has_tools: bool, gemini_conv_id: str = "", conv=None, messages_raw=None, model_name: str = "", completion_id: str = "", attachments=None, base_url: str = "", request=None, req=None, gem_id=None, account_id=None, extended_thinking: bool = False) -> AsyncGenerator[str, None]:
     """非流式收集 + 切片伪流式：用于有工具调用/附件、需要完整文本的场景。"""
     # 立即发出首帧 SSE，避免生图/工具路径在 generate() 阻塞期间零字节导致前置代理超时。
     first = StreamChunk(
@@ -640,7 +685,8 @@ async def _stream_response_buffered(prompt: str, model: str, has_tools: bool, ge
 
     async def _run_generate():
         return await gemini_client.generate(prompt, model, gemini_conv_id, attachments,
-                                            gem_id=gem_id, account_id=account_id)
+                                            gem_id=gem_id, account_id=account_id,
+                                            extended_thinking=extended_thinking)
 
     gen_task = asyncio.create_task(_run_generate())
     try:
@@ -655,11 +701,14 @@ async def _stream_response_buffered(prompt: str, model: str, has_tools: bool, ge
     try:
         result = gen_task.result()
     except Exception as e:
-        if gemini_conv_id and messages_raw:
+        if gemini_conv_id and messages_raw and not _resource_failure(e):
             full_prompt = build_prompt_from_messages(messages_raw)
+            if has_tools and req is not None:
+                full_prompt = build_tool_prompt(full_prompt, [t.model_dump() for t in (req.tools or [])], req.tool_choice)
             retry_task = asyncio.create_task(
                 gemini_client.generate(full_prompt, model, "", attachments,
-                                       gem_id=gem_id, account_id=account_id)
+                                       gem_id=gem_id, account_id=account_id,
+                                       extended_thinking=extended_thinking)
             )
             try:
                 async for ping in _sse_keepalive_during(retry_task):
@@ -671,6 +720,8 @@ async def _stream_response_buffered(prompt: str, model: str, has_tools: bool, ge
                 raise
             try:
                 result = retry_task.result()
+                prompt = full_prompt
+                gemini_conv_id = ""
             except Exception as e2:
                 emitted = False
                 async for chunk in _maybe_fallback_stream(request, req, messages_raw, model, completion_id, model_name):
@@ -698,6 +749,13 @@ async def _stream_response_buffered(prompt: str, model: str, has_tools: bool, ge
             yield chunk
         if emitted:
             return
+        if result.get("thoughts"):
+            yield format_sse(StreamChunk(
+                id=completion_id, model=model_name,
+                choices=[StreamChoice(delta=StreamDelta(reasoning_content=result["thoughts"]))],
+            ).model_dump())
+        yield _err_chunk(HTTPStatusError(502, "Gemini upstream returned no usable answer."))
+        return
 
     text = result.get("text", "")
     gen_images = result.get("images") or []
@@ -706,22 +764,22 @@ async def _stream_response_buffered(prompt: str, model: str, has_tools: bool, ge
         text = (md + "\n" + text.strip()) if text.strip() else md
     new_conv_id = result.get("conversation_id", "")
 
-    if new_conv_id and conv:
-        conv.gemini_conv_id = new_conv_id
-        conv.add_message("assistant", text)
-        await conversation_store.update(conv)
-
     if has_tools:
         # 此刻只发过 role 首帧 + keepalive，还没发任何 content 块，重试是安全的。
         async def _regenerate_for_tools() -> str:
+            nonlocal result, text, new_conv_id
             r = await gemini_client.generate(prompt, model, gemini_conv_id, attachments,
-                                             gem_id=gem_id, account_id=account_id)
-            return r.get("text", "")
+                                             gem_id=gem_id, account_id=account_id,
+                                             extended_thinking=extended_thinking)
+            result = r
+            text = r.get("text", "")
+            new_conv_id = r.get("conversation_id", "")
+            return text
 
         # 畸形工具 JSON 的重试要再跑一整轮上游 generate()——这条流早就开了（role 首帧已发），
         # 裸 await 会在这段已开的连接上制造一次远超单个 keepalive 间隔的死寂（issue #10
         # followup F2）。用与上面 gen_task 相同的 task + keepalive 套路续上心跳。
-        parse_task = asyncio.create_task(parse_tool_response_with_retry(text, _regenerate_for_tools))
+        parse_task = asyncio.create_task(parse_tool_response_with_retry(text, _regenerate_for_tools, propagate_errors=True))
         try:
             async for ping in _sse_keepalive_during(parse_task):
                 yield ping
@@ -730,11 +788,34 @@ async def _stream_response_buffered(prompt: str, model: str, has_tools: bool, ge
             if parse_task.done() and not parse_task.cancelled():
                 parse_task.exception()   # 取回异常，避免 asyncio 在 GC 时打印 "Task exception was never retrieved"
             raise
-        parsed = parse_task.result()
+        try:
+            parsed = parse_task.result()
+        except Exception as exc:
+            yield _err_chunk(exc)
+            return
+        if req is not None:
+            contract_error = validate_tool_result(parsed, [t.model_dump() for t in (req.tools or [])], req.tool_choice)
+            if contract_error:
+                yield _err_chunk(HTTPStatusError(502, "Gemini upstream tool contract failed: " + contract_error))
+                return
+
+    if new_conv_id and conv:
+        conv.gemini_conv_id = new_conv_id
+        conv.add_message("assistant", text)
+        await conversation_store.update(conv)
+
+    if result.get("thoughts"):
+        yield format_sse(StreamChunk(
+            id=completion_id, model=model_name,
+            choices=[StreamChoice(delta=StreamDelta(reasoning_content=result["thoughts"]))],
+        ).model_dump())
+
+    if has_tools:
         if parsed["type"] == "tool_calls":
-            for tc in parsed["tool_calls"]:
+            for index, tc in enumerate(parsed["tool_calls"]):
                 call_id = f"call_{uuid.uuid4().hex[:8]}"
                 tool_call_data = {
+                    "index": index,
                     "id": call_id,
                     "type": "function",
                     "function": {

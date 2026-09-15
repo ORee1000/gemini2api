@@ -9,7 +9,7 @@ def test_reasoning_effort_enables_thinking_and_returns_reasoning_content(gem_cli
         return {"text": "answer", "images": [], "conversation_id": "c", "thoughts": "my thoughts"}
     monkeypatch.setattr(oai.gemini_client, "generate", fake_generate)
     r = gem_client.post("/v1/chat/completions", json={
-        "model": "gemini-flash", "messages": [{"role": "user", "content": "hi"}],
+        "model": "gemini-flash-thinking", "messages": [{"role": "user", "content": "hi"}],
         "reasoning_effort": "high",
     }, headers=_AUTH)
     assert r.status_code == 200
@@ -75,7 +75,7 @@ def test_thinking_failure_falls_back_to_normal_generate(gem_client, monkeypatch)
         return {"text": "recovered", "images": [], "conversation_id": "c", "thoughts": ""}
     monkeypatch.setattr(oai.gemini_client, "generate", fake_generate)
     r = gem_client.post("/v1/chat/completions", json={
-        "model": "gemini-flash", "messages": [{"role": "user", "content": "hi"}],
+        "model": "gemini-flash-thinking", "messages": [{"role": "user", "content": "hi"}],
         "reasoning_effort": "high",
     }, headers=_AUTH)
     assert r.status_code == 200
@@ -99,7 +99,7 @@ def test_thinking_failure_then_normal_also_fails_returns_error(gem_client, monke
         raise ValueError("still broken")
     monkeypatch.setattr(oai.gemini_client, "generate", fake_generate)
     r = gem_client.post("/v1/chat/completions", json={
-        "model": "gemini-flash", "messages": [{"role": "user", "content": "hi"}],
+        "model": "gemini-flash-thinking", "messages": [{"role": "user", "content": "hi"}],
         "reasoning_effort": "high",
     }, headers=_AUTH)
     assert calls == [True, False]
@@ -122,7 +122,7 @@ def test_streaming_emits_reasoning_content_before_done(gem_client, monkeypatch):
 
     monkeypatch.setattr(oai.gemini_client, "generate_stream", fake_generate_stream)
     with gem_client.stream("POST", "/v1/chat/completions", json={
-        "model": "gemini-flash", "messages": [{"role": "user", "content": "hi"}],
+        "model": "gemini-flash-thinking", "messages": [{"role": "user", "content": "hi"}],
         "reasoning_effort": "high", "stream": True,
     }, headers=_AUTH) as r:
         body = "".join(r.iter_text())
