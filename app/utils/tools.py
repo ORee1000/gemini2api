@@ -189,6 +189,16 @@ def build_tool_prompt(prompt: str, tools: list[dict], tool_choice=None) -> str:
         '{"status": "text", "content": "Hello, how can I help?"}'
     )
 
+    if tool_choice == "required" or isinstance(tool_choice, dict):
+        system_block = system_block.replace(
+            'To reply with plain text instead, output:\n'
+            '{"status": "text", "content": "<your reply>"}\n\n', '')
+        system_block = system_block.replace(
+            'Example (plain text reply):\n'
+            '{"status": "text", "content": "Hello, how can I help?"}', '')
+    elif tool_choice == "none":
+        # No tool descriptions/examples when the caller disabled tool use.
+        return prompt
     return f"{system_block}\n\nUser message: {prompt}"
 
 
@@ -242,19 +252,21 @@ def _normalize_tool_calls(tc) -> list | None:
     out = []
     for item in tc:
         if not isinstance(item, dict):
-            continue
+            return None
         # 兼容 OpenAI 风格 {"function":{"name","arguments"}} 和简单 {"name","arguments"}
         fn = item.get("function") if isinstance(item.get("function"), dict) else item
         name = fn.get("name")
-        if not name:
-            continue
+        if not isinstance(name, str) or not name.strip():
+            return None
         args = fn.get("arguments", {})
         if isinstance(args, str):
             try:
                 args = json.loads(args)
-            except Exception:
-                args = {"_raw": args}
-        out.append({"name": name, "arguments": args if isinstance(args, dict) else {}})
+            except (ValueError, TypeError):
+                return None
+        if not isinstance(args, dict):
+            return None
+        out.append({"name": name, "arguments": args})
     return out or None
 
 
@@ -310,7 +322,7 @@ def parse_tool_response(text: str) -> dict:
     looks_like_tool = ('"tool_use"' in text or '"tool_calls"' in text
                        or ('"name"' in text and '"arguments"' in text))
     if looks_like_tool:
-        logger.warning(f"工具调用 JSON 解析失败，畸形片段不透传: {text[:120]!r}")
+        logger.warning("Malformed tool JSON withheld (characters=%d)", len(text))
         return {"type": "text", "content": MALFORMED_TOOL_NOTICE}
 
     # 普通文本（非工具意图）原样返回
@@ -361,3 +373,27 @@ async def parse_tool_response_with_retry(text: str, regenerate) -> dict:
 
 def estimate_tokens(text: str) -> int:
     return len(text) // 4
+
+
+def validate_tool_result(parsed: dict, tools: list[dict], tool_choice=None) -> str | None:
+    """Check the caller's wire contract; never synthesize or partially execute calls."""
+    if is_malformed_tool_result(parsed):
+        return "malformed tool JSON"
+    forced = tool_choice.get("function", {}).get("name") if isinstance(tool_choice, dict) else None
+    required = tool_choice == "required" or bool(forced)
+    if parsed.get("type") != "tool_calls":
+        return "required tool call missing" if required else None
+    if tool_choice == "none":
+        return "tool calls disabled by caller"
+    allowed = {t.get("function", t).get("name") for t in tools if isinstance(t, dict)}
+    calls = parsed.get("tool_calls")
+    if not isinstance(calls, list) or not calls:
+        return "empty tool call list"
+    for call in calls:
+        if call.get("name") not in allowed:
+            return "tool not declared by caller"
+        if forced and call.get("name") != forced:
+            return "named tool choice not respected"
+        if not isinstance(call.get("arguments"), dict):
+            return "tool arguments must be a JSON object"
+    return None

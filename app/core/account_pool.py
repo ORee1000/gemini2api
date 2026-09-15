@@ -7,7 +7,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from app.core.gemini_client import GeminiWebClient, HTTPStatusError, NO_HEALTHY_ACCOUNT_MSG
+from app.core.gemini_client import GeminiWebClient, HTTPStatusError, NO_HEALTHY_ACCOUNT_MSG, _validate_web_prompt
 from app.core.fallback import is_empty_result
 from app.config import settings
 from app.core.usage_metrics import live_metrics
@@ -33,6 +33,11 @@ EMPTY_STREAK_THRESHOLD = 3
 def _is_5xx(exc: Exception) -> bool:
     """判断异常是否为 5xx（含 Google 503 限流），这类可换账号 failover 重试。"""
     return isinstance(exc, HTTPStatusError) and 500 <= exc.status_code < 600
+
+
+def _is_transient_resource_error(exc: Exception) -> bool:
+    """Resource pressure is not evidence of invalid credentials, even mid-stream."""
+    return isinstance(exc, HTTPStatusError) and (exc.status_code == 429 or 500 <= exc.status_code < 600)
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -74,9 +79,12 @@ def _error_summary(exc: Exception) -> str:
     异常类型 + 状态码已经足够分辨"是限流、是凭据失效、还是客户端没就绪"，
     比现在完全空白的 last_error 强，且零泄露风险。
     """
-    if isinstance(exc, HTTPStatusError):
-        return f"{type(exc).__name__} (HTTP {exc.status_code})"
-    return type(exc).__name__
+    summary = f"{type(exc).__name__} (HTTP {exc.status_code})" if isinstance(exc, HTTPStatusError) else type(exc).__name__
+    for attr, label in (("upstream_rpc_status", "RPC"), ("upstream_bard_code", "BardErrorInfo")):
+        value = getattr(exc, attr, None)
+        if type(value) is int and 0 <= value <= 999999:
+            summary += f"; {label} {value}"
+    return summary
 
 
 class AccountStatus(str, Enum):
@@ -523,7 +531,7 @@ class AccountPool:
                 account.error_count += 1
                 account.cooldown_until = asyncio.get_event_loop().time() + settings.failover_cooldown
                 logger.warning(
-                    f"Account {account.id} cooled down for {settings.failover_cooldown}s (5xx rate-limit)"
+                    f"Account {account.id} cooled down for {settings.failover_cooldown}s (transient upstream resource error)"
                 )
             else:
                 account.error_count += 1
@@ -750,6 +758,7 @@ class AccountPool:
                        account_id: str | None = None, extended_thinking: bool = False) -> dict:
         # failover：某账号被可重试错误（5xx/未就绪/401·403）打回时，换下一个 active 账号重试，
         # 直到成功或无更多账号可试。5xx 限流账号进入冷却，401/403 标 expired。
+        _validate_web_prompt(prompt, model)
         tried: set = set()
         # 绑定账号：排除其他所有账号，使 acquire/failover 只可能选中目标账号
         if account_id:
@@ -792,13 +801,13 @@ class AccountPool:
                     # 可重试：5xx 冷却该账号、401/403 标 expired，换下一个账号重试
                     last_err = e
                     tried.add(account.id)
-                    await self.release(account, success=False, cooldown=_is_5xx(e), error=_error_summary(e))
+                    await self.release(account, success=False, cooldown=_is_transient_resource_error(e), error=_error_summary(e))
                     released = True
                     if isinstance(e, HTTPStatusError) and e.status_code in (401, 403):
                         account.status = AccountStatus.EXPIRED
                     logger.warning(f"Account {account.id} got {e}; failing over (tried={len(tried)})")
                     continue
-                await self.release(account, success=False, error=_error_summary(e))
+                await self.release(account, success=False, cooldown=_is_transient_resource_error(e), error=_error_summary(e))
                 released = True
                 raise
             finally:
@@ -815,6 +824,7 @@ class AccountPool:
         failover：仅在「尚未向客户端 yield 任何内容前」遇到可重试错误（5xx/未就绪/401·403）才换账号重试
         （已经吐出部分内容后再换账号会导致重复，故此时只能终止）。
         """
+        _validate_web_prompt(prompt, model)
         tried: set = set()
         # 绑定账号：排除其他所有账号，使 acquire/failover 只可能选中目标账号
         if account_id:
@@ -874,14 +884,14 @@ class AccountPool:
                 if _is_retryable(e) and not emitted_any:
                     last_err = e
                     tried.add(account.id)
-                    await self.release(account, success=False, cooldown=_is_5xx(e), error=_error_summary(e))
+                    await self.release(account, success=False, cooldown=_is_transient_resource_error(e), error=_error_summary(e))
                     released = True
                     if isinstance(e, HTTPStatusError) and e.status_code in (401, 403):
                         account.status = AccountStatus.EXPIRED
                     logger.warning(f"Account {account.id} got {e} before first chunk; stream failing over (tried={len(tried)})")
                     failover = True
                 else:
-                    await self.release(account, success=False, error=_error_summary(e))
+                    await self.release(account, success=False, cooldown=_is_transient_resource_error(e), error=_error_summary(e))
                     released = True
                     raise
             finally:

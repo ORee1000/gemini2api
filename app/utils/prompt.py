@@ -63,6 +63,29 @@ def last_user_text(messages: list[dict]) -> str:
     return ""
 
 
+
+_JSON_STRING_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
+def _readable_json_arguments(value: str) -> str:
+    """Decode JSON string escapes without changing numbers, key order or duplicates.
+
+    Tool history often carries ASCII-escaped CJK. The web transport flattens the
+    entire history into one prompt, so these escapes consume six characters per
+    letter. Only the wire representation changes; stored messages stay intact.
+    Invalid JSON and unpaired surrogates pass through unchanged.
+    """
+    try:
+        json.loads(value)
+        def render(match):
+            token = json.dumps(json.loads(match.group()), ensure_ascii=False)
+            token.encode("utf-8")
+            return token
+        return _JSON_STRING_TOKEN.sub(render, value)
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        return value
+
+
 def build_prompt_from_messages(messages: list[dict], system: str | None = None,
                                tool_prompt: str | None = None) -> str:
     parts = []
@@ -119,7 +142,7 @@ def build_prompt_from_messages(messages: list[dict], system: str | None = None,
                     fn = {}
                 name = fn.get("name") or ""
                 args = fn.get("arguments")
-                args_str = args if isinstance(args, str) else ("" if args is None else str(args))
+                args_str = _readable_json_arguments(args) if isinstance(args, str) else ("" if args is None else str(args))
                 call_parts.append(f"[Tool call: {name}({args_str})]")
             if call_parts:
                 content = "\n".join([content, *call_parts]) if content else "\n".join(call_parts)
