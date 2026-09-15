@@ -366,7 +366,8 @@ async def chat_completions(req: ChatRequest, request: Request):
                                                            gem_id=gem_id, account_id=gem_account_id,
                                                            extended_thinking=False)
                     gemini_conv_id = ""
-                except Exception:
+                except Exception as recovery_error:
+                    err = recovery_error
                     fb = await _fallback_result(request, req, messages_raw, resolved_model)
                     if fb is not None:
                         return JSONResponse(content=fb)
@@ -407,6 +408,30 @@ async def chat_completions(req: ChatRequest, request: Request):
     new_conv_id = result.get("conversation_id", "")
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
+    if has_tools:
+        async def _regenerate_for_tools() -> str:
+            nonlocal result, text, new_conv_id
+            r = await gemini_client.generate(prompt, resolved_model, gemini_conv_id, attachments,
+                                             gem_id=gem_id, account_id=gem_account_id,
+                                             extended_thinking=extended_thinking)
+            result = r
+            text = r.get("text", "")
+            new_conv_id = r.get("conversation_id", "")
+            return text
+
+        try:
+            parsed = await parse_tool_response_with_retry(text, _regenerate_for_tools, propagate_errors=True)
+        except Exception as exc:
+            status, err_type, retry_after = classify_error(exc)
+            return JSONResponse(status_code=status, content={"error": {
+                "message": str(exc), "type": err_type}},
+                headers={"Retry-After": str(retry_after)} if retry_after else None)
+        contract_error = validate_tool_result(parsed, [t.model_dump() for t in req.tools], req.tool_choice)
+        if contract_error:
+            return JSONResponse(status_code=502, content={"error": {
+                "message": "Gemini upstream tool contract failed: " + contract_error,
+                "type": "api_error", "code": "upstream_tool_contract"}})
+
     # 持久化对话
     if new_conv_id:
         if not conv:
@@ -421,18 +446,6 @@ async def chat_completions(req: ChatRequest, request: Request):
         await conversation_store.update(conv)
 
     if has_tools:
-        async def _regenerate_for_tools() -> str:
-            r = await gemini_client.generate(prompt, resolved_model, gemini_conv_id, attachments,
-                                             gem_id=gem_id, account_id=gem_account_id,
-                                             extended_thinking=extended_thinking)
-            return r.get("text", "")
-
-        parsed = await parse_tool_response_with_retry(text, _regenerate_for_tools)
-        contract_error = validate_tool_result(parsed, [t.model_dump() for t in req.tools], req.tool_choice)
-        if contract_error:
-            return JSONResponse(status_code=502, content={"error": {
-                "message": "Gemini upstream tool contract failed: " + contract_error,
-                "type": "api_error", "code": "upstream_tool_contract"}})
         if parsed["type"] == "tool_calls":
             tool_calls = []
             for i, tc in enumerate(parsed["tool_calls"]):
@@ -557,6 +570,7 @@ async def _stream_response(prompt: str, model: str, has_tools: bool, gemini_conv
                     tail = final_text[len(full_text):]
                     full_text = final_text
                     if tail:
+                        streamed_any = True
                         chunk = StreamChunk(
                             id=completion_id, model=model_name,
                             choices=[StreamChoice(delta=StreamDelta(content=tail))],
@@ -568,18 +582,26 @@ async def _stream_response(prompt: str, model: str, has_tools: bool, gemini_conv
                 final_images = evt.get("images") or []
     except Exception as e:
         # 流式失败：会话ID 过期等场景，用完整 prompt 非流式重试一次
-        if gemini_conv_id and messages_raw and not streamed_any and not _resource_failure(e):
+        if gemini_conv_id and messages_raw and not streamed_any and not emitted_thoughts and not _resource_failure(e):
             try:
                 retry_prompt = build_prompt_from_messages(messages_raw)
                 result = await gemini_client.generate(retry_prompt, model, "", attachments,
                                                       gem_id=gem_id, account_id=account_id,
-                                                      extended_thinking=False)
+                                                      extended_thinking=extended_thinking)
                 full_text = result.get("text", "")
                 new_conv_id = result.get("conversation_id", "")
                 final_images = result.get("images") or []
+                emitted_thoughts = result.get("thoughts") or ""
+                if emitted_thoughts or full_text:
+                    streamed_any = bool(full_text)
+                    yield format_sse(StreamChunk(
+                        id=completion_id, model=model_name,
+                        choices=[StreamChoice(delta=StreamDelta(
+                            content=full_text or None, reasoning_content=emitted_thoughts or None))],
+                    ).model_dump())
             except Exception as e2:
                 # 尚未流出任何内容（只发过 role 首帧）→ 可安全改用第三方兜底（流式）
-                if not streamed_any:
+                if not streamed_any and not emitted_thoughts:
                     emitted = False
                     async for chunk in _maybe_fallback_stream(request, req, messages_raw, model, completion_id, model_name):
                         emitted = True
@@ -589,7 +611,7 @@ async def _stream_response(prompt: str, model: str, has_tools: bool, gemini_conv
                 yield _err_chunk(e2)
                 return
         else:
-            if not streamed_any:
+            if not streamed_any and not emitted_thoughts:
                 emitted = False
                 async for chunk in _maybe_fallback_stream(request, req, messages_raw, model, completion_id, model_name):
                     emitted = True
@@ -601,12 +623,13 @@ async def _stream_response(prompt: str, model: str, has_tools: bool, gemini_conv
 
     # Gemini 真流式整条为空（只发过 role 首帧，未流出任何内容）→ 第三方兜底
     if not streamed_any and not (full_text or "").strip() and not final_images:
-        emitted = False
-        async for chunk in _maybe_fallback_stream(request, req, messages_raw, model, completion_id, model_name):
-            emitted = True
-            yield chunk
-        if emitted:
-            return
+        if not emitted_thoughts:
+            emitted = False
+            async for chunk in _maybe_fallback_stream(request, req, messages_raw, model, completion_id, model_name):
+                emitted = True
+                yield chunk
+            if emitted:
+                return
         yield _err_chunk(HTTPStatusError(502, "Gemini upstream returned no usable answer."))
         return
 
@@ -697,6 +720,8 @@ async def _stream_response_buffered(prompt: str, model: str, has_tools: bool, ge
                 raise
             try:
                 result = retry_task.result()
+                prompt = full_prompt
+                gemini_conv_id = ""
             except Exception as e2:
                 emitted = False
                 async for chunk in _maybe_fallback_stream(request, req, messages_raw, model, completion_id, model_name):
@@ -732,12 +757,6 @@ async def _stream_response_buffered(prompt: str, model: str, has_tools: bool, ge
         yield _err_chunk(HTTPStatusError(502, "Gemini upstream returned no usable answer."))
         return
 
-    if result.get("thoughts"):
-        yield format_sse(StreamChunk(
-            id=completion_id, model=model_name,
-            choices=[StreamChoice(delta=StreamDelta(reasoning_content=result["thoughts"]))],
-        ).model_dump())
-
     text = result.get("text", "")
     gen_images = result.get("images") or []
     if gen_images:
@@ -745,23 +764,22 @@ async def _stream_response_buffered(prompt: str, model: str, has_tools: bool, ge
         text = (md + "\n" + text.strip()) if text.strip() else md
     new_conv_id = result.get("conversation_id", "")
 
-    if new_conv_id and conv:
-        conv.gemini_conv_id = new_conv_id
-        conv.add_message("assistant", text)
-        await conversation_store.update(conv)
-
     if has_tools:
         # 此刻只发过 role 首帧 + keepalive，还没发任何 content 块，重试是安全的。
         async def _regenerate_for_tools() -> str:
+            nonlocal result, text, new_conv_id
             r = await gemini_client.generate(prompt, model, gemini_conv_id, attachments,
                                              gem_id=gem_id, account_id=account_id,
                                              extended_thinking=extended_thinking)
-            return r.get("text", "")
+            result = r
+            text = r.get("text", "")
+            new_conv_id = r.get("conversation_id", "")
+            return text
 
         # 畸形工具 JSON 的重试要再跑一整轮上游 generate()——这条流早就开了（role 首帧已发），
         # 裸 await 会在这段已开的连接上制造一次远超单个 keepalive 间隔的死寂（issue #10
         # followup F2）。用与上面 gen_task 相同的 task + keepalive 套路续上心跳。
-        parse_task = asyncio.create_task(parse_tool_response_with_retry(text, _regenerate_for_tools))
+        parse_task = asyncio.create_task(parse_tool_response_with_retry(text, _regenerate_for_tools, propagate_errors=True))
         try:
             async for ping in _sse_keepalive_during(parse_task):
                 yield ping
@@ -770,16 +788,34 @@ async def _stream_response_buffered(prompt: str, model: str, has_tools: bool, ge
             if parse_task.done() and not parse_task.cancelled():
                 parse_task.exception()   # 取回异常，避免 asyncio 在 GC 时打印 "Task exception was never retrieved"
             raise
-        parsed = parse_task.result()
+        try:
+            parsed = parse_task.result()
+        except Exception as exc:
+            yield _err_chunk(exc)
+            return
         if req is not None:
             contract_error = validate_tool_result(parsed, [t.model_dump() for t in (req.tools or [])], req.tool_choice)
             if contract_error:
                 yield _err_chunk(HTTPStatusError(502, "Gemini upstream tool contract failed: " + contract_error))
                 return
+
+    if new_conv_id and conv:
+        conv.gemini_conv_id = new_conv_id
+        conv.add_message("assistant", text)
+        await conversation_store.update(conv)
+
+    if result.get("thoughts"):
+        yield format_sse(StreamChunk(
+            id=completion_id, model=model_name,
+            choices=[StreamChoice(delta=StreamDelta(reasoning_content=result["thoughts"]))],
+        ).model_dump())
+
+    if has_tools:
         if parsed["type"] == "tool_calls":
-            for tc in parsed["tool_calls"]:
+            for index, tc in enumerate(parsed["tool_calls"]):
                 call_id = f"call_{uuid.uuid4().hex[:8]}"
                 tool_call_data = {
+                    "index": index,
                     "id": call_id,
                     "type": "function",
                     "function": {

@@ -115,3 +115,43 @@ review pending explicit authorization for sending that private context upstream.
 That replay did not run. The long probe above uses entirely synthetic records;
 it is a successful transport test, not a claim that the original private request
 was replayed successfully or that intermittent upstream failures are eliminated.
+
+## Second source review
+
+Additional reproducible defects in OpenAI-compatible delivery:
+
+- Streaming tool calls omitted `index`, required by the OpenAI delta contract.
+  Each call now has its own index and id, so consumers can assemble a batch.
+  Reference: https://github.com/openai/openai-python/blob/main/src/openai/types/chat/chat_completion_chunk.py
+- A successful non-streamed recovery inside a streaming request could finish
+  without emitting its recovered answer. Recovery now emits the answer and
+  associated reasoning and retains the requested thinking option.
+- Emitted reasoning and final-only text were not consistently counted as output.
+  Once either is emitted, failure ends that stream with an error; no regenerated
+  or fallback answer is appended. Reasoning without an answer still fails.
+- Malformed-tool regeneration swallowed actual upstream exceptions. OpenAI opts
+  into error propagation, preserving 429/5xx and terminal recovery errors rather
+  than disguising them as generic format failures. Legacy Claude retry handling
+  is unchanged; cancellation and the one-regeneration limit remain intact.
+- Rejected tool generations were committed before validation, and a successful
+  regeneration retained the first attempt's conversation id and reasoning.
+  Validation now precedes state changes; accepted text, conversation id and
+  reasoning come from the same attempt. Failed attempts do not change the local
+  conversation record. This does not undo any remote Gemini conversation state.
+- After buffered conversation recovery, malformed-tool regeneration still used
+  the expired conversation and short prompt. It now uses the recovered full
+  prompt, including tools, with the expired conversation cleared.
+- Invalid `tool_calls` could hide behind `status: text`. Explicit malformed tool
+  intent now remains a failure even when a text field is also present.
+
+Tests use neutral synthetic content and no tool execution. They cover both HTTP
+and SSE, resource errors during regeneration, accepted-versus-rejected history,
+partial reasoning, final-only output, recovery, and multiple tool indices.
+These defects are proven adapter bugs; they do not establish the private cause
+of Google's intermittent 1095/1096 failures or guarantee upstream availability.
+
+Second-review validation: 697 passed, 30 Node-dependent frontend tests skipped,
+Ruff correctness gate passed. Sixteen new regression cases exercise the paths
+above. Read-only inspection of the deployed Hermes `_ToolCallAccumulator`
+confirmed it already tolerates missing indices when ids distinguish calls;
+therefore missing indices are not asserted as the sole cause of Kratos failures.

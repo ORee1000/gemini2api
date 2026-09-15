@@ -188,7 +188,7 @@ def test_openai_non_stream_valid_first_time_calls_generate_once(gem_client, monk
     assert counter["n"] == 1, "零回归：首次合法不得重试"
 
 
-def test_openai_non_stream_retry_failure_is_an_explicit_502(gem_client, monkeypatch):
+def test_openai_non_stream_retry_failure_preserves_actual_error(gem_client, monkeypatch):
     import app.routers.openai as oai
     calls = {"n": 0}
 
@@ -205,8 +205,8 @@ def test_openai_non_stream_retry_failure_is_an_explicit_502(gem_client, monkeypa
         "tools": _OPENAI_TOOLS,
     }, headers=_AUTH)
 
-    assert r.status_code == 502
-    assert r.json()["error"]["code"] == "upstream_tool_contract"
+    assert r.status_code == 500
+    assert r.json()["error"]["message"] == "pool busy"
     assert "choices" not in r.json()
     assert calls["n"] == 2
 

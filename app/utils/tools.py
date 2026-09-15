@@ -284,6 +284,8 @@ def _try_parse(text: str) -> dict | None:
         calls = _normalize_tool_calls(parsed.get("tool_calls"))
         if calls:
             return {"type": "tool_calls", "tool_calls": calls}
+        # Explicit tool intent takes precedence, even when status says text.
+        return {"type": "text", "content": MALFORMED_TOOL_NOTICE}
     if status == "text" and "content" in parsed:
         return {"type": "text", "content": parsed["content"]}
     # 整段就是一个工具调用对象 {"name":...,"arguments":...}
@@ -338,7 +340,7 @@ def is_malformed_tool_result(parsed) -> bool:
     )
 
 
-async def parse_tool_response_with_retry(text: str, regenerate) -> dict:
+async def parse_tool_response_with_retry(text: str, regenerate, *, propagate_errors: bool = False) -> dict:
     """解析工具调用文本；判定为畸形时用 ``regenerate()`` 重新取一次文本，再解析一次。
 
     **明确不做「截断 JSON 自动修补」**：补全一个被截断的工具调用，等于拿猜出来的参数
@@ -348,7 +350,8 @@ async def parse_tool_response_with_retry(text: str, regenerate) -> dict:
     约束：
     - **最多重试一次**，不递归；首次即合法时一次都不重试（不平白加倍延迟）。
     - ``regenerate()`` 抛异常 / 返回空 / 二次仍畸形 → 一律返回**首次**结果。
-      重试绝不能把一次"降级成功"变成 500。
+      Legacy callers retain this behavior. OpenAI uses propagate_errors=True
+      so resource failures retain their status and backoff semantics.
     """
     parsed = parse_tool_response(text)
     if regenerate is None or not is_malformed_tool_result(parsed):
@@ -358,7 +361,9 @@ async def parse_tool_response_with_retry(text: str, regenerate) -> dict:
     try:
         retry_text = await regenerate()
     except Exception as e:
-        logger.warning(f"工具调用重试失败，沿用首次降级结果: {e}")
+        if propagate_errors:
+            raise
+        logger.warning("Tool regeneration failed (%s); retaining malformed result", type(e).__name__)
         return parsed
 
     if not isinstance(retry_text, str) or not retry_text.strip():
