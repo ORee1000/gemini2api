@@ -83,3 +83,35 @@ contract or prevent every Google Web refusal.
   and API authentication remain separately configured.
 
 Local private evidence: `/home/ubuntu/gemini2api-audit-20260915/`.
+
+
+## Deployment and live verification
+
+The reviewed runtime code (`cb4a98e`) was deployed at 2026-09-15 10:16 UTC in
+`local/gemini2api:codex-cb4a98e-r1`. All five affected live source hashes match the
+reviewed source plus the existing deployment-specific alias transform. The
+native cold-start check passed; gateway drain completed and was cleared. The
+main profile remains on OpenRouter; private configuration and persona files
+were hash-checked unchanged.
+
+The first local derivative image failed its actual non-root startup because
+COPY had left source files owned by root while the existing alias boot script
+needs to update them. Deployment automatically rolled back. The derivative
+build was corrected with COPY --chown=appuser:appuser and retested through the
+real entrypoint before the successful second deployment. This was a packaging
+mistake in the local derivative build, not an upstream RPC cause. The repository's
+standard Dockerfile already performs the needed ownership setup.
+
+Live probes, with no tool execution or Telegram messages:
+
+- Flash: one neutral request, one tool, HTTP 200, correct transport_probe call
+  with ready value and tool_calls completion; 4.33 seconds.
+- Flash-thinking: synthetic long history containing 250 messages and 40 tools,
+  HTTP 200, correct transport_probe call and tool_calls completion; 40.86 seconds.
+- No upstream error frames or successful empty completions in these two probes.
+
+Replay of the original private request dump was blocked by automatic approval
+review pending explicit authorization for sending that private context upstream.
+That replay did not run. The long probe above uses entirely synthetic records;
+it is a successful transport test, not a claim that the original private request
+was replayed successfully or that intermittent upstream failures are eliminated.
