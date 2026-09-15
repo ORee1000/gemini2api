@@ -155,3 +155,27 @@ Ruff correctness gate passed. Sixteen new regression cases exercise the paths
 above. Read-only inspection of the deployed Hermes `_ToolCallAccumulator`
 confirmed it already tolerates missing indices when ids distinguish calls;
 therefore missing indices are not asserted as the sole cause of Kratos failures.
+
+### Second-review deployment and live outcomes
+
+Deployed code `22fd2a8` at 2026-09-15 11:09 UTC in
+`local/gemini2api:codex-22fd2a8`
+(`sha256:392286fc2a3bb66c48db1ed6f23cfca84f8c0df676588875a10731fdc7952c92`).
+Native gateway drain completed, five live source hashes matched, six cold-start
+contract cases passed, protected profile files were unchanged, and the drain
+marker was cleared. Rollback image and compose were retained.
+
+Live synthetic probes (no private-context replay, tool execution or Telegram send):
+
+| Probe | Result |
+| --- | --- |
+| Flash, 1 message / 1 tool | Initial request emitted an SSE error with code 502 after 6.38 s; no successful completion or executable tool call. The probe did not retain its error message, so the exact subtype is unconfirmed. |
+| Flash-thinking, 250 messages / 40 tools | Correct named tool, index 0, tool_calls finish, no error frames; 28.60 s. |
+| Flash, bounded short-request recheck | Correct named tool, index 0, tool_calls finish, no error frames; 13.66 s. |
+
+These runs supplied no reasoning content; they verify delivery of available
+fields, not that either upstream model always exposes reasoning. Success on
+recheck does not erase the first failed probe. Intermittent Web/model output
+failures remain possible and must be surfaced truthfully, rather than converted
+to empty successful responses. OpenRouter remains the user's selected main route.
+Private test/deployment evidence: `/home/ubuntu/gemini2api-audit-20260915/review-2/`.
